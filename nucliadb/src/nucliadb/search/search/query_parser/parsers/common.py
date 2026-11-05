@@ -1,0 +1,371 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import re
+import string
+from datetime import datetime
+
+from nidx_protos import nodereader_pb2
+
+from nucliadb.common.exceptions import InvalidQueryError
+from nucliadb.common.filter_expression import parse_expression, parse_kv_expression
+from nucliadb.search import logger
+from nucliadb.search.search.metrics import query_parser_observer
+from nucliadb.search.search.query_parser.exceptions import InternalParserError
+from nucliadb.search.search.query_parser.fetcher import Fetcher
+from nucliadb.search.search.query_parser.models import (
+    Filters,
+    KeywordQuery,
+    NoopReranker,
+    PredictReranker,
+    RankFusion,
+    ReciprocalRankFusion,
+    Reranker,
+    SemanticQuery,
+)
+from nucliadb.search.search.query_parser.old_filters import OldFilterParams, parse_old_filters
+from nucliadb.search.search.utils import filter_hidden_resources, kb_security_enforced
+from nucliadb_models import RequestSecurity
+from nucliadb_models import search as search_models
+from nucliadb_models.filters import FilterExpression
+from nucliadb_models.search import MAX_RANK_FUSION_WINDOW, Filter
+
+DEFAULT_GENERIC_SEMANTIC_THRESHOLD = 0.7
+
+
+def validate_query_syntax(query: str) -> str:
+    """Filter some queries that panic tantivy, better than returning the 500"""
+
+    # -* is an invalid query in tantivy and it won't return results but if you add some whitespaces
+    # between - and *, it will actually trigger a tantivy bug and panic
+    INVALID_QUERY = re.compile(r"- *\*+")
+    if INVALID_QUERY.search(query):
+        # remove the * and extra spaces, as it's probably what doesn't have
+        # meaning in both cases: -* and - *
+        fixed = re.sub(INVALID_QUERY, "- ", query)
+        query = fixed
+
+    return query
+
+
+def is_empty_query(request: search_models.BaseSearchRequest) -> bool:
+    return len(request.query) == 0
+
+
+def has_user_vectors(request: search_models.BaseSearchRequest) -> bool:
+    return request.vector is not None and len(request.vector) > 0
+
+
+def is_exact_match_only_query(request: search_models.BaseSearchRequest) -> bool:
+    """
+    '"something"' -> True
+    'foo "something" else' -> False
+    """
+    query = request.query.strip()
+    return len(query) > 0 and query.startswith('"') and query.endswith('"')
+
+
+def should_disable_vector_search(request: search_models.BaseSearchRequest) -> bool:
+    if has_user_vectors(request):
+        return False
+
+    if is_exact_match_only_query(request):
+        return True
+
+    if is_empty_query(request):
+        return True
+
+    return False
+
+
+def parse_top_k(item: search_models.BaseSearchRequest) -> int:
+    assert item.top_k is not None, "top_k must have an int value"
+    top_k = item.top_k
+    return top_k
+
+
+async def parse_keyword_query(
+    item: search_models.BaseSearchRequest,
+    *,
+    fetcher: Fetcher,
+) -> KeywordQuery:
+    query = item.query
+
+    # only when a query image is used, we use the rephrased query for keyword
+    # search
+    if item.query_image is not None:
+        rephrased_query = await fetcher.get_rephrased_query()
+        if rephrased_query is not None:
+            query = rephrased_query
+
+    is_synonyms_query = False
+    if item.with_synonyms:
+        synonyms_query = await query_with_synonyms(query, fetcher=fetcher)
+        if synonyms_query is not None:
+            query = synonyms_query
+            is_synonyms_query = True
+
+    # after all query transformations, pass a validator that can fix some
+    # queries that trigger a panic on the index
+    query = validate_query_syntax(query)
+
+    min_score = parse_keyword_min_score(item.min_score)
+
+    return KeywordQuery(
+        query=query,
+        is_synonyms_query=is_synonyms_query,
+        min_score=min_score,
+    )
+
+
+async def parse_semantic_query(
+    item: search_models.SearchRequest | search_models.FindRequest,
+    *,
+    fetcher: Fetcher,
+) -> SemanticQuery:
+    vectorset = await fetcher.get_vectorset()
+    query = await fetcher.get_query_vector()
+
+    min_score = await parse_semantic_min_score(item.min_score, fetcher=fetcher)
+
+    return SemanticQuery(query=query, vectorset=vectorset, min_score=min_score)
+
+
+def parse_keyword_min_score(
+    min_score: float | search_models.MinScore | None,
+) -> float:
+    # Keep backward compatibility with the deprecated min_score payload
+    # parameter being a float (specifying semantic)
+    if min_score is None or isinstance(min_score, float) or isinstance(min_score, int):
+        return 0.0
+    else:
+        return min_score.bm25
+
+
+async def parse_semantic_min_score(
+    min_score: float | search_models.MinScore | None,
+    *,
+    fetcher: Fetcher,
+):
+    if min_score is None:
+        min_score = None
+    elif isinstance(min_score, search_models.MinScore):
+        min_score = min_score.semantic
+
+    if min_score is None:
+        # min score not defined by the user, we'll try to get the default
+        # from Predict API
+        min_score = await fetcher.get_semantic_min_score()
+        if min_score is None:
+            logger.warning(
+                "Semantic threshold not found in query information, using default",
+                extra={"kbid": fetcher.kbid},
+            )
+            min_score = DEFAULT_GENERIC_SEMANTIC_THRESHOLD
+
+    return min_score
+
+
+async def query_with_synonyms(
+    query: str,
+    *,
+    fetcher: Fetcher,
+) -> str | None:
+    """
+    Replace the terms in the query with an expression that will make it match with the configured synonyms.
+    We're using the Tantivy's query language here: https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html
+
+    Example:
+    - Synonyms: Foo -> Bar, Baz
+    - Query: "What is Foo?"
+    - Advanced Query: "What is (Foo OR Bar OR Baz)?"
+    """
+    if not query:
+        return None
+
+    synonyms = await fetcher.get_synonyms()
+    if synonyms is None:
+        # No synonyms found
+        return None
+
+    # Calculate term variants: 'term' -> '(term OR synonym1 OR synonym2)'
+    variants: dict[str, str] = {}
+    for term, term_synonyms in synonyms.terms.items():
+        if len(term_synonyms.synonyms) > 0:
+            variants[term] = "({})".format(" OR ".join([term, *list(term_synonyms.synonyms)]))
+
+    # Split the query into terms
+    query_terms = query.split()
+
+    # Remove punctuation from the query terms
+    clean_query_terms = [term.strip(string.punctuation) for term in query_terms]
+
+    # Replace the original terms with the variants if the cleaned term is in the variants
+    term_with_synonyms_found = False
+    for index, clean_term in enumerate(clean_query_terms):
+        if clean_term in variants:
+            term_with_synonyms_found = True
+            query_terms[index] = query_terms[index].replace(clean_term, variants[clean_term])
+
+    if term_with_synonyms_found:
+        advanced_query = " ".join(query_terms)
+        return advanced_query
+
+    return None
+
+
+@query_parser_observer.wrap({"type": "parse_filters"})
+async def parse_filters(
+    kbid: str,
+    fetcher: Fetcher,
+    *,
+    show_hidden: bool = False,
+    security: RequestSecurity | None = None,
+    with_duplicates: bool = False,
+    facets: list[str] | None = None,
+    # new-style filter expression
+    filter_expression: FilterExpression | None = None,
+    # old-style filters (superseded by filter expressions)
+    label_filters: list[str] | list[Filter] | None = None,
+    keyword_filters: list[str] | list[Filter] | None = None,
+    resource_filters: list[str] | None = None,
+    fields: list[str] | None = None,
+    range_creation_start: datetime | None = None,
+    range_creation_end: datetime | None = None,
+    range_modification_start: datetime | None = None,
+    range_modification_end: datetime | None = None,
+) -> Filters:
+    facets = facets or []
+    label_filters = label_filters or []
+    keyword_filters = keyword_filters or []
+    resource_filters = resource_filters or []
+    fields = fields or []
+
+    has_old_filters = (
+        len(label_filters) > 0
+        or len(keyword_filters) > 0
+        or len(resource_filters) > 0
+        or len(fields) > 0
+        or range_creation_start is not None
+        or range_creation_end is not None
+        or range_modification_start is not None
+        or range_modification_end is not None
+    )
+    if filter_expression is not None and has_old_filters:
+        raise InvalidQueryError("filter_expression", "Cannot mix old filters with filter_expression")
+
+    field_expr = None
+    paragraph_expr = None
+    filter_operator = nodereader_pb2.FilterOperator.AND
+
+    if has_old_filters:
+        old_filters = OldFilterParams(
+            label_filters=label_filters,
+            keyword_filters=keyword_filters,
+            key_filters=resource_filters,
+            fields=fields,
+            range_creation_start=range_creation_start,
+            range_creation_end=range_creation_end,
+            range_modification_start=range_modification_start,
+            range_modification_end=range_modification_end,
+        )
+        field_expr, paragraph_expr = await parse_old_filters(old_filters, fetcher)
+
+    json_expr = None
+    if filter_expression is not None:
+        if filter_expression.field:
+            field_expr = await parse_expression(filter_expression.field, kbid)
+        if filter_expression.key_value:
+            json_expr = await parse_kv_expression(filter_expression.key_value, kbid)
+        if filter_expression.paragraph:
+            paragraph_expr = await parse_expression(filter_expression.paragraph, kbid)
+        if filter_expression.operator == FilterExpression.Operator.OR:
+            filter_operator = nodereader_pb2.FilterOperator.OR
+        else:
+            filter_operator = nodereader_pb2.FilterOperator.AND
+
+    hidden = await filter_hidden_resources(kbid, show_hidden)
+    security = await kb_security_enforced(kbid, security)
+
+    return Filters(
+        facets=facets,
+        field_expression=field_expr,
+        paragraph_expression=paragraph_expr,
+        filter_expression_operator=filter_operator,
+        json_expression=json_expr,
+        security=security,
+        hidden=hidden,
+        with_duplicates=with_duplicates,
+    )
+
+
+def parse_rank_fusion(
+    rank_fusion: search_models.RankFusionName | search_models.RankFusion,
+    top_k: int,
+) -> RankFusion:
+    _rank_fusion: RankFusion
+
+    window = min(top_k, MAX_RANK_FUSION_WINDOW)
+
+    if isinstance(rank_fusion, search_models.RankFusionName):
+        if rank_fusion == search_models.RankFusionName.RECIPROCAL_RANK_FUSION:
+            _rank_fusion = ReciprocalRankFusion(window=window)
+        else:
+            raise InternalParserError(f"Unknown rank fusion algorithm: {rank_fusion}")
+
+    elif isinstance(rank_fusion, search_models.ReciprocalRankFusion):
+        user_window = rank_fusion.window
+        _rank_fusion = ReciprocalRankFusion(
+            k=rank_fusion.k,
+            boosting=rank_fusion.boosting,
+            window=min(max(user_window or 0, top_k), 500),
+        )
+
+    else:
+        raise InternalParserError(f"Unknown rank fusion {rank_fusion}")
+
+    return _rank_fusion
+
+
+def parse_reranker(
+    reranker: search_models.RerankerName | search_models.Reranker,
+    top_k: int,
+) -> Reranker:
+    _reranker: Reranker
+
+    if isinstance(reranker, search_models.RerankerName):
+        if reranker == search_models.RerankerName.NOOP:
+            _reranker = NoopReranker()
+
+        elif reranker == search_models.RerankerName.PREDICT_RERANKER:
+            # for predict rearnker, by default, we want a x2 factor with a
+            # top of 200 results
+            _reranker = PredictReranker(window=min(top_k * 2, 200))
+
+        else:
+            raise InternalParserError(f"Unknown reranker algorithm: {reranker}")
+
+    elif isinstance(reranker, search_models.PredictReranker):
+        user_window = reranker.window
+        _reranker = PredictReranker(window=min(max(user_window or 0, top_k), 200))
+
+    else:
+        raise InternalParserError(f"Unknown reranker {reranker}")
+
+    return _reranker

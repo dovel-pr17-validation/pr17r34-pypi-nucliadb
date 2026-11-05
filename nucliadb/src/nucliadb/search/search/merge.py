@@ -1,0 +1,582 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import asyncio
+import datetime
+from collections.abc import Iterable
+from typing import Any
+
+from nidx_protos.nodereader_pb2 import (
+    DocumentResult,
+    DocumentSearchResponse,
+    GraphSearchResponse,
+    ParagraphResult,
+    ParagraphSearchResponse,
+    SearchResponse,
+    SuggestResponse,
+    VectorSearchResponse,
+)
+
+from nucliadb.common.ids import ParagraphId, VectorId
+from nucliadb.common.models_utils import from_proto
+from nucliadb.common.models_utils.from_proto import (
+    RelationNodeTypePbMap,
+    RelationTypePbMap,
+)
+from nucliadb.models.internal.augment import AugmentedParagraph, Metadata, ParagraphText
+from nucliadb.models.internal.augment import Paragraph as AugmentorParagraph
+from nucliadb.search import logger
+from nucliadb.search.augmentor.augmentor import augment_paragraphs
+from nucliadb.search.augmentor.resources import augment_resources_deep
+from nucliadb.search.search.cut import cut_page
+from nucliadb.search.search.fetch import get_labels_resource
+from nucliadb.search.search.hydrator import ResourceHydrationOptions
+from nucliadb.search.search.paragraphs import highlight_paragraph
+from nucliadb.search.search.query_parser.models import FulltextQuery, UnitRetrieval
+from nucliadb_models.labels import translate_system_to_alias_label
+from nucliadb_models.search import (
+    DirectionalRelation,
+    EntitySubgraph,
+    KnowledgeboxSearchResults,
+    KnowledgeboxSuggestResults,
+    Paragraph,
+    Paragraphs,
+    RelatedEntities,
+    RelatedEntity,
+    RelationDirection,
+    Relations,
+    ResourceResult,
+    Resources,
+    ResourceSearchResults,
+    Sentence,
+    Sentences,
+    SortField,
+    SortOptions,
+    SortOrder,
+    TextPosition,
+)
+from nucliadb_protos.utils_pb2 import RelationNode
+
+from .metrics import merge_observer
+
+Bm25Score = tuple[float, bytes, int]
+TimestampScore = datetime.datetime
+TitleScore = str
+SortValue = Bm25Score | TimestampScore | TitleScore
+
+
+async def merge_documents_results(
+    kbid: str,
+    response: DocumentSearchResponse,
+    *,
+    query: FulltextQuery,
+    top_k: int,
+    offset: int,
+    min_score: float,
+) -> tuple[Resources, set[str]]:
+    total = response.total
+    next_page = response.next_page
+
+    facets: dict[str, Any] = {}
+    if response.facets:
+        for key, value in response.facets.items():
+            key = translate_system_to_alias_label(key)
+            for facetresult in value.facetresults:
+                facet_label = translate_system_to_alias_label(facetresult.tag)
+                facets.setdefault(key, {}).setdefault(facet_label, 0)
+                facets[key][facet_label] += facetresult.total
+
+    raw_resource_list: list[tuple[DocumentResult, SortValue]] = []
+    for result in response.results:
+        if result.score.bm25 < min_score:
+            logger.warning(
+                f"Skipping document result with score {result.score.bm25} below min_score {min_score}. This should not happen, as nidx should have filtered it out.",
+                extra={"kbid": kbid, "result_id": result.uuid},
+            )
+            continue
+        sort_value: SortValue
+        if query.order_by == SortField.SCORE:
+            sort_value = (result.score.bm25, result.shard_id, -result.score.docaddr)
+        else:
+            sort_value = result.date.ToDatetime()
+        if sort_value is not None:
+            raw_resource_list.append((result, sort_value))
+
+    # We need to cut first and then sort, otherwise the page will be wrong if the order is DESC
+    raw_resource_list, has_more = cut_page(raw_resource_list[offset:], top_k)
+    next_page = next_page or has_more
+
+    # Sort the list by score. It's important that this sort is stable, so the
+    # ordering of results with same scores accross multiple shards doesn't change
+    raw_resource_list.sort(key=lambda x: x[1], reverse=(query.sort == SortOrder.DESC))
+
+    result_resource_ids = set()
+    result_resource_list: list[ResourceResult] = []
+    for result, _ in raw_resource_list:
+        labels = await get_labels_resource(result, kbid)
+        _, field_type, field = result.field.split("/")
+
+        result_resource_list.append(
+            ResourceResult(
+                score=result.score.bm25,
+                rid=result.uuid,
+                field=field,
+                field_type=field_type,
+                labels=labels,
+            )
+        )
+        result_resource_ids.add(result.uuid)
+
+    return Resources(
+        facets=facets,
+        results=result_resource_list,
+        query=query.query,
+        total=total,
+        page_number=0,  # Bw/c with pagination
+        page_size=top_k,
+        next_page=next_page,
+        min_score=query.min_score,
+    ), result_resource_ids
+
+
+async def merge_suggest_paragraph_results(
+    suggest_response: SuggestResponse,
+    kbid: str,
+    *,
+    top_k: int,
+    highlight: bool,
+) -> Paragraphs:
+    query = suggest_response.query
+    ematches: list[str] = suggest_response.ematches  # type: ignore
+
+    # cut the best results
+    matches = suggest_response.results[:top_k]
+
+    augmented_paragraphs: dict[ParagraphId, AugmentedParagraph] = await augment_paragraphs(
+        kbid,
+        given=[
+            AugmentorParagraph(
+                id=ParagraphId.from_string(match.paragraph),
+                metadata=Metadata.from_paragraph_result(match),
+            )
+            for match in matches
+        ],
+        select=[ParagraphText()],
+    )
+
+    results = []
+    for match in matches:
+        paragraph_id = ParagraphId.from_string(match.paragraph)
+        augmented = augmented_paragraphs.get(paragraph_id)
+        text = augmented.text or "" if augmented else ""
+        if text and highlight:
+            try:
+                text = highlight_paragraph(text, words=match.matches, ematches=ematches)
+            except Exception as exc:
+                logger.warning("Error highlighting paragraph", extra={"kbid": kbid}, exc_info=exc)
+
+        # bw/c: historically, we returned labels from maindb, which didn't have the
+        # /l prefix. As we now return the labels from the index (which do have the
+        # /l), we trim the prefix
+        labels = list(set((label.removeprefix("/l/") for label in match.labels)))
+
+        suggested_paragraph = Paragraph(
+            score=match.score.bm25,
+            rid=match.uuid,
+            field_type=paragraph_id.field_id.type,
+            field=paragraph_id.field_id.key,
+            text=text,
+            labels=labels,
+            position=TextPosition(
+                index=match.metadata.position.index,
+                start=match.metadata.position.start,
+                end=match.metadata.position.end,
+                page_number=match.metadata.position.page_number,
+            ),
+            start_seconds=list(match.metadata.position.start_seconds) or None,
+            end_seconds=list(match.metadata.position.end_seconds) or None,
+        )
+        results.append(suggested_paragraph)
+
+    return Paragraphs(results=results, query=query, min_score=0)
+
+
+async def merge_vectors_results(
+    vector_response: VectorSearchResponse,
+    kbid: str,
+    top_k: int,
+    concurrency_control: asyncio.Semaphore | None = None,
+    min_score: float | None = None,
+) -> tuple[Sentences, set[str]]:
+    augments = []
+    result_index_by_id = {}
+    result_sentence_list: list[Sentence] = []
+    result_resource_ids = set()
+    for result in vector_response.documents[:top_k]:
+        if min_score is not None and result.score < min_score:
+            logger.warning(
+                f"Skipping vector result with score {result.score} below min_score {min_score}. This should not happen, as nidx should have filtered it out.",
+                extra={"kbid": kbid, "result_id": result.doc_id.id},
+            )
+            continue
+        vector_id = VectorId.from_string(result.doc_id.id)
+        # In case we have multiple vectors per paragraph, the vector id will
+        # have its start-end referencing a portion of the paragraph. However, we
+        # are interested in the whole paragraph, not only the portion, so we'll
+        # use the metadata.position to get the actual paragraph start-end
+        # positions
+        paragraph_id = ParagraphId(
+            field_id=vector_id.field_id,
+            paragraph_start=result.metadata.position.start,
+            paragraph_end=result.metadata.position.end,
+        )
+        augments.append(
+            AugmentorParagraph(id=paragraph_id, metadata=Metadata.from_vector_result(result))
+        )
+
+        result_sentence_list.append(
+            Sentence(
+                score=result.score,
+                rid=paragraph_id.rid,
+                field_type=paragraph_id.field_id.type,
+                field=paragraph_id.field_id.key,
+                text="",  # we batch augments and populate it afterwards
+                index=str(vector_id.index),
+                position=TextPosition(
+                    start=paragraph_id.paragraph_start,
+                    end=paragraph_id.paragraph_end,
+                    index=vector_id.index,
+                ),
+            )
+        )
+        result_index_by_id[paragraph_id] = len(result_sentence_list) - 1
+
+        result_resource_ids.add(vector_id.rid)
+
+    augmented_paragraphs: dict[ParagraphId, AugmentedParagraph] = await augment_paragraphs(
+        kbid, given=augments, select=[ParagraphText()], concurrency_control=concurrency_control
+    )
+    for paragraph_id, idx in result_index_by_id.items():
+        augmented = augmented_paragraphs.get(paragraph_id)
+        # this fallback to "" is the historical response, although it may not
+        # have much sense
+        text = augmented.text or "" if augmented else ""
+        sentence = result_sentence_list[idx]
+        sentence.text = text
+
+    return Sentences(
+        results=result_sentence_list,
+        facets={},
+        page_number=0,  # Bw/c with pagination
+        page_size=top_k,
+        min_score=round(min_score or 0, ndigits=3),
+    ), result_resource_ids
+
+
+async def merge_paragraph_results(
+    kbid: str,
+    paragraph_response: ParagraphSearchResponse,
+    top_k: int,
+    highlight: bool,
+    sort: SortOptions,
+    min_score: float,
+    offset: int,
+    concurrency_control: asyncio.Semaphore | None = None,
+) -> tuple[Paragraphs, set[str]]:
+    query = paragraph_response.query
+    ematches: list[str] = paragraph_response.ematches  # type: ignore
+    total = paragraph_response.total
+    next_page = paragraph_response.next_page
+
+    facets: dict[str, Any] = {}
+    if paragraph_response.facets:
+        for key, value in paragraph_response.facets.items():
+            key = translate_system_to_alias_label(key)
+            for facetresult in value.facetresults:
+                facet_label = translate_system_to_alias_label(facetresult.tag)
+                facets.setdefault(key, {}).setdefault(facet_label, 0)
+                facets[key][facet_label] += facetresult.total
+
+    raw_paragraph_list: list[tuple[ParagraphId, ParagraphResult, SortValue]] = []
+    for result in paragraph_response.results:
+        if result.score.bm25 < min_score:
+            logger.warning(
+                f"Skipping paragraph result with score {result.score.bm25} below min_score {min_score}. This should not happen, as nidx should have filtered it out.",
+                extra={"kbid": kbid, "result_id": result.paragraph},
+            )
+            continue
+        paragraph_id = ParagraphId.from_string(result.paragraph)
+
+        sort_value: SortValue
+        if sort.field == SortField.SCORE:
+            sort_value = (result.score.bm25, result.shard_id, -result.score.docaddr)
+        else:
+            sort_value = result.date.ToDatetime()
+        if sort_value is not None:
+            raw_paragraph_list.append((paragraph_id, result, sort_value))
+
+    # Sort the list by score. It's important that this sort is stable, so the
+    # ordering of results with same scores accross multiple shards doesn't change
+    raw_paragraph_list.sort(key=lambda x: x[2], reverse=(sort.order == SortOrder.DESC))
+
+    raw_paragraph_list, has_more = cut_page(raw_paragraph_list[offset:], top_k)
+    next_page = next_page or has_more
+
+    augmented_paragraphs: dict[ParagraphId, AugmentedParagraph] = await augment_paragraphs(
+        kbid,
+        given=[
+            AugmentorParagraph(id=paragraph_id, metadata=Metadata.from_paragraph_result(result))
+            for paragraph_id, result, _ in raw_paragraph_list
+        ],
+        select=[ParagraphText()],
+        concurrency_control=concurrency_control,
+    )
+
+    result_paragraph_list: list[Paragraph] = []
+    result_resource_ids = set()
+    for paragraph_id, result, _ in raw_paragraph_list:
+        augmented = augmented_paragraphs.get(paragraph_id)
+        text = augmented.text or "" if augmented else ""
+        if text and highlight:
+            try:
+                text = highlight_paragraph(text, words=result.matches, ematches=ematches)
+            except Exception as exc:
+                logger.warning("Error highlighting paragraph", extra={"kbid": kbid}, exc_info=exc)
+
+        fuzzy_result = len(result.matches) > 0
+        # bw/c: historically, we returned labels from maindb, which didn't have the
+        # /l prefix. As we now return the labels from the index (which do have the
+        # /l), we trim the prefix
+        labels = list(set((label.removeprefix("/l/") for label in result.labels)))
+
+        result_resource_ids.add(paragraph_id.rid)
+        result_paragraph_list.append(
+            Paragraph(
+                score=result.score.bm25,
+                rid=paragraph_id.rid,
+                field_type=paragraph_id.field_id.type,
+                field=paragraph_id.field_id.key,
+                text=text,
+                labels=labels,
+                position=TextPosition(
+                    index=result.metadata.position.index,
+                    start=result.metadata.position.start,
+                    end=result.metadata.position.end,
+                    page_number=result.metadata.position.page_number,
+                ),
+                fuzzy_result=fuzzy_result,
+                start_seconds=list(result.metadata.position.start_seconds) or None,
+                end_seconds=list(result.metadata.position.end_seconds) or None,
+            )
+        )
+
+    return Paragraphs(
+        results=result_paragraph_list,
+        facets=facets,
+        query=query,
+        total=total,
+        page_number=0,  # Bw/c with pagination
+        page_size=top_k,
+        next_page=next_page,
+        min_score=min_score,
+    ), result_resource_ids
+
+
+@merge_observer.wrap({"type": "merge_relations"})
+async def merge_relations_results(
+    graph_response: GraphSearchResponse,
+    query_entry_points: Iterable[RelationNode],
+    only_with_metadata: bool = False,
+) -> Relations:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, _merge_relations_results, graph_response, query_entry_points, only_with_metadata
+    )
+
+
+def _merge_relations_results(
+    graph_response: GraphSearchResponse,
+    query_entry_points: Iterable[RelationNode],
+    only_with_metadata: bool,
+) -> Relations:
+    """Merge relation search responses into a single Relations object while applying filters."""
+    relations = Relations(entities={})
+
+    for entry_point in query_entry_points:
+        relations.entities[entry_point.value] = EntitySubgraph(related_to=[])
+
+    for path in graph_response.graph:
+        relation = graph_response.relations[path.relation]
+        origin = graph_response.nodes[path.source]
+        destination = graph_response.nodes[path.destination]
+        relation_type = RelationTypePbMap[relation.relation_type]
+        relation_label = relation.label
+        metadata = path.metadata if path.HasField("metadata") else None
+        if path.resource_field_id is not None:
+            resource_id = path.resource_field_id.split("/")[0]
+
+        if only_with_metadata and not metadata:
+            continue
+
+        if origin.value in relations.entities:
+            relations.entities[origin.value].related_to.append(
+                DirectionalRelation(
+                    entity=destination.value,
+                    entity_type=RelationNodeTypePbMap[destination.ntype],
+                    entity_subtype=destination.subtype,
+                    relation=relation_type,
+                    relation_label=relation_label,
+                    direction=RelationDirection.OUT,
+                    metadata=from_proto.relation_metadata(metadata) if metadata else None,
+                    resource_id=resource_id,
+                )
+            )
+        elif destination.value in relations.entities:
+            relations.entities[destination.value].related_to.append(
+                DirectionalRelation(
+                    entity=origin.value,
+                    entity_type=RelationNodeTypePbMap[origin.ntype],
+                    entity_subtype=origin.subtype,
+                    relation=relation_type,
+                    relation_label=relation_label,
+                    direction=RelationDirection.IN,
+                    metadata=from_proto.relation_metadata(metadata) if metadata else None,
+                    resource_id=resource_id,
+                )
+            )
+
+    return relations
+
+
+@merge_observer.wrap({"type": "merge"})
+async def merge_results(
+    search_response: SearchResponse,
+    retrieval: UnitRetrieval,
+    kbid: str,
+    offset: int,
+    highlight: bool = False,
+    *,
+    resource_hydration_options: ResourceHydrationOptions,
+) -> KnowledgeboxSearchResults:
+    concurrency_control = asyncio.Semaphore(50)
+
+    api_results = KnowledgeboxSearchResults()
+    resources = set()
+
+    if retrieval.query.fulltext is not None:
+        api_results.fulltext, matched_resources = await merge_documents_results(
+            kbid,
+            search_response.document,
+            query=retrieval.query.fulltext,
+            top_k=retrieval.top_k,
+            offset=offset,
+            min_score=retrieval.query.fulltext.min_score,
+        )
+        resources.update(matched_resources)
+
+    if retrieval.query.keyword is not None:
+        sort = SortOptions(
+            field=retrieval.query.keyword.order_by,
+            order=retrieval.query.keyword.sort,
+        )
+        api_results.paragraphs, matched_resources = await merge_paragraph_results(
+            kbid,
+            search_response.paragraph,
+            retrieval.top_k,
+            highlight,
+            sort,
+            min_score=retrieval.query.keyword.min_score,
+            offset=offset,
+            concurrency_control=concurrency_control,
+        )
+        resources.update(matched_resources)
+
+    if retrieval.query.semantic is not None:
+        api_results.sentences, matched_resources = await merge_vectors_results(
+            search_response.vector,
+            kbid,
+            retrieval.top_k,
+            min_score=retrieval.query.semantic.min_score,
+            concurrency_control=concurrency_control,
+        )
+        resources.update(matched_resources)
+
+    if retrieval.query.relation is not None:
+        api_results.relations = await merge_relations_results(
+            search_response.graph, retrieval.query.relation.entry_points
+        )
+
+    api_results.resources = await augment_resources_deep(
+        kbid,
+        given=list(resources),
+        opts=resource_hydration_options,
+    )
+    return api_results
+
+
+async def merge_paragraphs_results(
+    response: SearchResponse,
+    top_k: int,
+    kbid: str,
+    highlight_split: bool,
+    min_score: float,
+) -> ResourceSearchResults:
+    api_results = ResourceSearchResults()
+
+    api_results.paragraphs, _ = await merge_paragraph_results(
+        kbid,
+        response.paragraph,
+        top_k,
+        highlight=highlight_split,
+        sort=SortOptions(
+            field=SortField.SCORE,
+            order=SortOrder.DESC,
+        ),
+        min_score=min_score,
+        offset=0,
+    )
+    return api_results
+
+
+def merge_suggest_entities_results(
+    suggest_response: SuggestResponse,
+) -> RelatedEntities:
+    unique_entities: set[RelatedEntity] = set()
+    response_entities = (
+        RelatedEntity(family=e.subtype, value=e.value) for e in suggest_response.entity_results.nodes
+    )
+    unique_entities.update(response_entities)
+
+    return RelatedEntities(entities=list(unique_entities), total=len(unique_entities))
+
+
+async def merge_suggest_results(
+    suggest_response: SuggestResponse,
+    kbid: str,
+    *,
+    top_k: int,
+    highlight: bool = False,
+) -> KnowledgeboxSuggestResults:
+    api_results = KnowledgeboxSuggestResults()
+
+    api_results.paragraphs = await merge_suggest_paragraph_results(
+        suggest_response, kbid, top_k=top_k, highlight=highlight
+    )
+    api_results.entities = merge_suggest_entities_results(suggest_response)
+    return api_results

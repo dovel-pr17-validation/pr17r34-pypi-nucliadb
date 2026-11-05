@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nucliadb"
+version = "7.2.0"
+license = "AGPL-3.0-or-later"
+description = "NucliaDB"
+authors = [{ name = "Nuclia", email = "nucliadb@nuclia.com" }]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: 3 :: Only",
+]
+requires-python = ">=3.11, <4"
+dependencies = [
+    # nucliadb dependencies are auto pinned on release
+    "nucliadb-telemetry[all]",
+    "nucliadb-utils[storages,fastapi,cache]",
+    "nucliadb-protos[grpc]",
+    "nucliadb-models",
+    "nidx-protos[grpc]",
+
+    "nucliadb-admin-assets>=1.0.0.post1224",
+    "nuclia-models>=0.62.0",
+
+    # external dependencies
+    "uvicorn[standard]",
+    "argdantic",
+
+    "aiohttp>=3.11.11",
+    "async-lru>=2",
+    "backoff",
+    "aiofiles>=0.8.0",
+    "psutil>=5.9.7",
+    "types-psutil>=5.9.5.17",
+    "types-aiofiles>=0.8.3",
+    "protobuf>=5",
+    "types-protobuf>=5,<8",
+    "grpcio>=1.71.0",
+    "grpcio-health-checking>=1.71.0",
+    "grpcio-channelz>=1.71.0",
+    "grpcio-status>=1.71.0",
+    "grpcio-tools>=1.71.0",
+    "grpcio-testing>=1.71.0",
+    "grpcio-reflection>=1.71.0",
+    "orjson>=3.6.7",
+    "types-setuptools",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "aiobotocore>=2.9.0",
+    "botocore>=1.34.0",
+    "google-cloud-storage",
+    "gcloud",
+    "oauth2client",
+    "jwcrypto>=1.5.6",
+    "pyyaml>=5.1",
+
+    "fastapi-versioning>=0.10.0",
+    "fastapi>=0.95.2",
+    "sentry-sdk[fastapi]>=2.8.0",
+    "pyjwt>=2.4.0",
+    "mmh3>=3.0.0",
+    "httpx>=0.23.0",
+    "grpc-stubs",
+    "aiodns>=3.0.0",
+
+    "types-orjson",
+
+    "psycopg[binary,pool]",
+
+    # improve dependency resolution
+    "multidict>=6.0.4",
+    "deprecated>=1.2.12",
+    "asgiref>=3.3.2",
+    "jmespath>=1.0.0",
+    "idna>=3.3",
+    "sniffio>=1.2.0",
+
+    "async_lru>=2.0.4",
+    "async-timeout>=4.0.3",
+    "cachetools>=5.3.2",
+    "types-cachetools>=5.3.0.5",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=4.3.4"]
+
+[project.scripts]
+# Service commands
+# Standalone
+nucliadb = "nucliadb.standalone.run:run"
+# Ingest
+#   - This command runs pull workers + ingest write consumer
+nucliadb-ingest = "nucliadb.ingest.app:run_consumer"
+#   - Only runs processed resources write consumer
+nucliadb-ingest-processed-consumer = "nucliadb.ingest.app:run_processed_consumer"
+#   - Only runs GRPC Service
+nucliadb-ingest-orm-grpc = "nucliadb.ingest.app:run_orm_grpc"
+#   - Subscriber workers: auditing, shard creator, materializer, import, export and backup consumers
+nucliadb-ingest-subscriber-workers = "nucliadb.ingest.app:run_subscriber_workers"
+# Reader
+nucliadb-reader = "nucliadb.reader.run:run"
+# Writer
+nucliadb-writer = "nucliadb.writer.run:run"
+# Search
+nucliadb-search = "nucliadb.search.run:run"
+# Train
+nucliadb-train = "nucliadb.train.run:run"
+# utilities
+nucliadb-purge = "nucliadb.purge:run"
+nucliadb-orphan-shards = "nucliadb.purge.orphan_shards:run"
+nucliadb-migrate = "nucliadb.migrator.command:main"
+nucliadb-rebalance = "nucliadb.common.cluster.rebalance:main"
+nucliadb-validate-migrations = "nucliadb.migrator.command:validate"
+nucliadb-migration-runner = "nucliadb.migrator.command:main_forever"
+nucliadb-metrics-exporter = "nucliadb.metrics_exporter:main"
+nucliadb-rollover-kbid = "nucliadb.common.cluster.rollover:rollover_kbid_command"
+nucliadb-extract-openapi-reader = "nucliadb.reader.openapi:command_extract_openapi"
+nucliadb-extract-openapi-search = "nucliadb.search.openapi:command_extract_openapi"
+nucliadb-extract-openapi-writer = "nucliadb.writer.openapi:command_extract_openapi"
+nucliadb-dataset-upload = "nucliadb.train.upload:run"
+
+[project.urls]
+"Nuclia" = "https://nuclia.com"
+"Github" = "https://github.com/nuclia/nucliadb"
+"Slack" = "https://nuclia-community.slack.com"
+"API Reference" = "https://docs.nuclia.dev/docs/api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nucliadb = ["standalone/static/*"]

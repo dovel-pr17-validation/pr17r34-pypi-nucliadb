@@ -1,0 +1,123 @@
+# Copyright 2021 Bosutech XXI S.L.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import os
+import sys
+from contextlib import AbstractContextManager, nullcontext
+
+import click
+from fastapi import FastAPI
+from uvicorn.config import Config
+from uvicorn.server import Server
+
+from nucliadb_telemetry.fastapi import application_metrics
+from nucliadb_utils import logger
+from nucliadb_utils.settings import running_settings
+
+STARTUP_FAILURE = 3
+
+
+def metrics_app() -> tuple[Server, Config]:
+    metrics_config = Config(
+        application_metrics,
+        host=running_settings.metrics_host,
+        port=running_settings.metrics_port,
+        loop="auto",
+        http="auto",
+        reload=False,
+        workers=1,
+        use_colors=False,
+        log_config=None,
+        limit_concurrency=None,
+        backlog=2047,
+        limit_max_requests=None,
+        timeout_keep_alive=5,
+    )
+    metrics_server = Server(config=metrics_config)
+    return metrics_server, metrics_config
+
+
+async def serve_metrics() -> Server:
+    server, config = metrics_app()
+    await start_server(server, config)
+    return server
+
+
+def run_fastapi_with_metrics(application: FastAPI) -> None:
+    metrics_server, metrics_config = metrics_app()
+    config = Config(
+        application,
+        host=running_settings.serving_host,
+        port=running_settings.serving_port,
+        loop="auto",
+        http="auto",
+        reload=False,
+        workers=1,
+        use_colors=False,
+        log_config=None,
+        limit_concurrency=None,
+        backlog=2047,
+        limit_max_requests=None,
+        timeout_keep_alive=5,
+    )
+    server = Server(config=config)
+
+    async def serve_both():
+        await start_server(metrics_server, metrics_config)
+        await run_server_forever(server, config)
+        await metrics_server.shutdown()
+
+    asyncio.run(serve_both())
+
+    if not metrics_server.started or not server.started:
+        sys.exit(STARTUP_FAILURE)
+
+
+async def start_server(server: Server, config: Config):
+    """
+    Abstracted out of Server.serve to allow running multiple servers
+    and not trounce on signal handlers.
+    """
+    if not config.loaded:
+        config.load()
+
+    server.lifespan = config.lifespan_class(config)
+
+    await server.startup()
+
+
+async def run_server_forever(server: Server, config: Config):
+    await start_server(server, config)
+    process_id = os.getpid()
+
+    # compatibility with uvicorn<0.29
+    capture_signals: AbstractContextManager
+    if hasattr(server, "install_signal_handlers"):  # pragma: no cover
+        server.install_signal_handlers()  # type: ignore[ty:call-non-callable]
+        capture_signals = nullcontext()
+    else:
+        # uvicorn>=0.29
+        capture_signals = server.capture_signals()
+
+    with capture_signals:
+        message = "Started server process [%d]"
+        color_message = "Started server process [" + click.style("%d", fg="cyan") + "]"
+        logger.info(message, process_id, extra={"color_message": color_message})
+
+        if server.should_exit:
+            return
+
+        await server.main_loop()
+        await server.shutdown()

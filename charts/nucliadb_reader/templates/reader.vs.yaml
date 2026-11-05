@@ -1,0 +1,90 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: reader
+spec:
+  gateways:
+    - "{{ .Values.vs.gateway }}"
+  hosts:
+    - "{{ .Values.zone }}.{{ .Values.vs.host }}"
+  http:
+    - name: nucliadb_reader
+      match:
+        # KBs and config
+        - method:
+            regex: "GET|OPTIONS"
+          uri:
+            regex: '^/api/v\d+/kb/[^/]+$'
+        - method:
+            regex: "GET|OPTIONS"
+          uri:
+            regex: '^/api/v\d+/kb/s/[^/]+$'
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/configuration'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/extract_strategies.*'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/split_strategies.*'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/processing_webhooks.*'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/kv-schemas.*'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/vectorsets$'
+          method:
+            regex: "GET|OPTIONS"
+
+        - method:
+            regex: "GET|OPTIONS"
+          uri:
+            regex: '^/api/v\d+/kb/[^/]+/(entitiesgroup|labelset|custom-synonyms|export|import|notifications|processing-status)s?.*'
+        - method:
+            regex: "GET|HEAD|OPTIONS"
+          uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+$'
+        - method:
+            regex: "GET|OPTIONS"
+          uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/(text|file|link|conversation|key_value).*'
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/resources'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/model.*'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/schema'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/search_configurations/[^/]+$'
+          method:
+            regex: "GET"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/search_configurations$'
+          method:
+            regex: "GET|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/generative_providers'
+          method:
+            regex: "GET|OPTIONS"
+      retries:
+        attempts: 3
+        retryOn: connect-failure
+      route:
+        - destination:
+            port:
+              number: {{.Values.serving.port}}
+            host: "reader.{{ .Release.Namespace }}.svc.cluster.local"

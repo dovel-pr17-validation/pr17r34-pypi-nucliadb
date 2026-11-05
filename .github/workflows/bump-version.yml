@@ -1,0 +1,56 @@
+## XXX This can not currently run with restrictions we have on branch protections
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      semType:
+        description: 'Semantic version part to bump'
+        required: true
+        default: 'bug'
+        type: choice
+        options:
+        - major
+        - minor
+        - bug
+
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Generate a token
+      id: app-token
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        app-id: ${{ secrets.GHAPP_ID_NUCLIABOT }}
+        private-key: ${{ secrets.PK_GHAPP_NUCLIABOT }}
+        owner: nuclia
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+
+    - run: python bump.py --sem=${{ inputs.semType }}
+
+    - name: Setup Python
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: "3.15.0"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+    # we update the lock to reflect the newly updated versions of our packages
+    - name: Update uv.lock
+      run: uv lock
+
+    - name: Commit & Push changes
+      uses: actions-js/push@968f4695ca558093eadb24ad83cc5891f47e0cdc # v1.6
+      with:
+        github_token: ${{ steps.app-token.outputs.token }}

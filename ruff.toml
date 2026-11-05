@@ -1,0 +1,30 @@
+target-version = "py311"
+line-length = 105
+
+exclude = [
+    "*.pyi",
+    "src/nucliadb_telemetry/tests/grpc/*",
+    "src/nucliadb_utils/nuclia_usage/protos/*"
+]
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP007",  # pyupgrade: Union[A, B] -> A | B and Optional[A] -> A | None
+    "RUF",  # ruff
+]
+
+ignore = [
+  "E501",
+  "E203",
+  "E252",
+  "E701",
+  "F541",
+  "F901",
+]
+
+[lint.isort]
+known-first-party = ["nucliadb*"]

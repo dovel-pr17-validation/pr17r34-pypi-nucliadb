@@ -1,0 +1,1134 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import asyncio
+import logging
+
+import aiohttp.client_exceptions
+import nats.errors
+import nats.js.errors
+from nidx_protos import noderesources_pb2, nodewriter_pb2
+from nidx_protos.noderesources_pb2 import Resource as PBBrainResource
+
+from nucliadb.common import datamanagers, locking
+from nucliadb.common.catalog import catalog_delete, catalog_update
+from nucliadb.common.cluster.settings import settings as cluster_settings
+from nucliadb.common.cluster.utils import get_shard_manager
+from nucliadb.common.external_index_providers.base import ExternalIndexManager
+from nucliadb.common.external_index_providers.manager import get_external_index_manager
+from nucliadb.common.ids import FIELD_TYPE_PB_TO_STR
+from nucliadb.common.maindb.driver import Driver, Transaction
+from nucliadb.common.maindb.exceptions import ConflictError, MaindbServerError
+from nucliadb.ingest.orm.exceptions import (
+    DeadletteredError,
+    InvalidBrokerMessage,
+    ResourceNotIndexable,
+    SequenceOrderViolation,
+)
+from nucliadb.ingest.orm.index_message import IndexMessageBuilder
+from nucliadb.ingest.orm.knowledgebox import KnowledgeBox
+from nucliadb.ingest.orm.metrics import processor_observer
+from nucliadb.ingest.orm.processor import sequence_manager
+from nucliadb.ingest.orm.processor.auditing import collect_audit_fields
+from nucliadb.ingest.orm.processor.data_augmentation import (
+    get_generated_fields,
+    send_generated_fields_to_process,
+)
+from nucliadb.ingest.orm.resource import (
+    Resource,
+)
+from nucliadb_models import content_types
+from nucliadb_models.common import CloudLink
+from nucliadb_models.content_types import GENERIC_MIME_TYPE
+from nucliadb_protos import (
+    knowledgebox_pb2,
+    resources_pb2,
+    writer_pb2,
+)
+from nucliadb_protos.resources_pb2 import Basic as PBBasic
+from nucliadb_protos.resources_pb2 import FieldID
+from nucliadb_telemetry import errors
+from nucliadb_utils import const
+from nucliadb_utils.cache.pubsub import PubSubDriver
+from nucliadb_utils.storages.storage import Storage
+from nucliadb_utils.utilities import get_storage, has_feature
+
+logger = logging.getLogger("ingest-processor")
+
+MESSAGE_TO_NOTIFICATION_SOURCE = {
+    writer_pb2.BrokerMessage.MessageSource.WRITER: writer_pb2.NotificationSource.WRITER,
+    writer_pb2.BrokerMessage.MessageSource.PROCESSOR: writer_pb2.NotificationSource.PROCESSOR,
+}
+
+
+def validate_indexable_resource(resource: noderesources_pb2.Resource) -> None:
+    """
+    It would be more optimal to move this to another layer but it'd also make the code
+    more difficult to grok and test because we'd need to move processable check and throw
+    an exception in the middle of a bunch of processing logic.
+
+    As it is implemented right now, we just do the check if a resource is indexable right
+    before we actually try to index it and not buried it somewhere else in the code base.
+
+    This is still an edge case.
+    """
+    num_paragraphs = 0
+    first_exceeded = ""
+    for field_id, fparagraph in resource.paragraphs.items():
+        # this count should not be very expensive to do since we don't have
+        # a lot of different fields and we just do a count on a dict
+        num_paragraphs += len(fparagraph.paragraphs)
+        if num_paragraphs > cluster_settings.max_resource_paragraphs:
+            first_exceeded = field_id
+
+    if num_paragraphs > cluster_settings.max_resource_paragraphs:
+        raise ResourceNotIndexable(
+            first_exceeded,
+            f"Resource has too many paragraphs ({num_paragraphs}) and cannot be indexed. "
+            f"The maximum number of paragraphs per resource is {cluster_settings.max_resource_paragraphs}",
+        )
+
+
+def trim_entity_facets(index_message: PBBrainResource) -> list[tuple[str, str]]:
+    max_entities = cluster_settings.max_entity_facets
+    warnings = []
+    for field_id, text_info in index_message.texts.items():
+        if len(text_info.labels) > max_entities:
+            new_labels = []
+            entity_count = 0
+            truncated = False
+            for label in text_info.labels:
+                if label.startswith("/e/"):
+                    if entity_count < max_entities:
+                        new_labels.append(label)
+                    else:
+                        truncated = True
+                    entity_count += 1
+                else:
+                    new_labels.append(label)
+            if truncated:
+                warnings.append(
+                    (
+                        field_id,
+                        f"Too many detected entities. Only the first {max_entities} will be available as facets for filtering",
+                    )
+                )
+                text_info.ClearField("labels")
+                text_info.labels.extend(new_labels)
+
+    return warnings
+
+
+class Processor:
+    """
+    This class is responsible for processing messages from the broker
+    and attempts to manage sequencing correctly with a txn id implementation.
+
+    The "txn" in this implementation is oriented around the sequence id of
+    messages coming through the message broker.
+
+    Not all writes are going to have a transaction id. For example, writes
+    coming from processor can be coming through a different channel
+    and can not use the txn id
+    """
+
+    def __init__(
+        self,
+        driver: Driver,
+        storage: Storage,
+        pubsub: PubSubDriver | None = None,
+        partition: str | None = None,
+    ):
+        self.driver = driver
+        self.storage = storage
+        self.partition = partition
+        self.pubsub = pubsub
+        self.index_node_shard_manager = get_shard_manager()
+
+    async def process(
+        self,
+        message: writer_pb2.BrokerMessage,
+        seqid: int,
+        partition: str | None = None,
+        transaction_check: bool = True,
+    ) -> None:
+        partition = partition if self.partition is None else self.partition
+        if partition is None:
+            raise AttributeError("Can't process message from unknown partition")
+
+        # When running in transactional mode, we need to check that
+        # that the current message doesn't violate the sequence order for the
+        # current partition
+        if transaction_check:
+            last_seqid = await sequence_manager.get_last_seqid(self.driver, partition)
+            if last_seqid is not None and seqid <= last_seqid:
+                raise SequenceOrderViolation(last_seqid)
+
+        if message.type == writer_pb2.BrokerMessage.MessageType.DELETE:
+            await self.delete_resource(message, seqid, partition, transaction_check)
+        elif message.type == writer_pb2.BrokerMessage.MessageType.AUTOCOMMIT:
+            await self.txn(message, seqid, partition, transaction_check)
+        else:  # pragma: no cover
+            logger.error(
+                f"Unsupported message type: {message.type}",
+                extra={"seqid": seqid, "partition": partition},
+            )
+
+    @processor_observer.wrap({"type": "delete_resource"})
+    async def delete_resource(
+        self,
+        message: writer_pb2.BrokerMessage,
+        seqid: int,
+        partition: str,
+        transaction_check: bool = True,
+    ) -> None:
+        kbid = message.kbid
+        uuid = (
+            message.uuid
+            if message.uuid
+            else await datamanagers.atomic.resources.get_rid(kbid=kbid, slug=message.slug)
+        )
+        if uuid is None:
+            logger.info(
+                "Resource or KB does not exist: skipping delete",
+                extra={"kbid": kbid, "slug": message.slug, "uuid": uuid},
+            )
+            if transaction_check:
+                async with datamanagers.with_rw_transaction() as txn:
+                    await sequence_manager.set_last_seqid(txn, partition, seqid)
+                    await txn.commit()
+            return
+
+        async with (
+            locking.distributed_lock(locking.RESOURCE_LOCK.format(kbid=kbid, resource_id=uuid)),
+            self.driver.rw_transaction() as txn,
+        ):
+            try:
+                logger.info("Deleting resource", extra={"kbid": kbid, "rid": uuid})
+                kb = KnowledgeBox(txn, self.storage, kbid)
+                shard_id = await datamanagers.resources.get_shard(txn, kbid=kbid, rid=uuid)
+                if shard_id is None:
+                    logger.warning(
+                        "Resource shard not found: Skipping delete", extra={"kbid": kbid, "rid": uuid}
+                    )
+                else:
+                    shard = await kb.get_resource_shard(shard_id)
+                    if shard is None:
+                        raise AttributeError("Shard not available")
+
+                    await catalog_delete(txn, kbid, uuid)
+
+                    external_index_manager = await get_external_index_manager(kbid=kbid)
+                    if external_index_manager is not None:
+                        await self.external_index_delete_resource(external_index_manager, uuid)
+                    else:
+                        await self.index_node_shard_manager.delete_resource(
+                            shard, uuid, seqid, partition, kbid
+                        )
+                    try:
+                        await kb.delete_resource(uuid)
+                    except Exception as exc:
+                        await txn.abort()
+                        await self.notify_abort(
+                            partition=partition,
+                            seqid=seqid,
+                            kbid=kbid,
+                            rid=uuid,
+                            source=message.source,
+                        )
+                        raise exc
+            finally:
+                if txn.open:
+                    if transaction_check:
+                        await sequence_manager.set_last_seqid(txn, partition, seqid)
+                    await txn.commit()
+        await self.notify_commit(
+            partition=partition,
+            seqid=seqid,
+            message=message,
+            write_type=writer_pb2.Notification.WriteType.DELETED,
+        )
+
+    @processor_observer.wrap({"type": "commit_slug"})
+    async def commit_slug(self, resource: Resource) -> None:
+        # Slug may have conflicts as its not partitioned properly,
+        # so we commit it in a different transaction to make it as short as possible
+        prev_txn = resource.txn
+        try:
+            async with self.driver.rw_transaction() as txn:
+                resource.txn = txn
+                await resource.set_slug()
+                await txn.commit()
+        finally:
+            resource.txn = prev_txn
+
+    @processor_observer.wrap({"type": "handle_data_augmentation_fields"})
+    async def handle_data_augmentation_fields(
+        self, message: writer_pb2.BrokerMessage, resource: Resource, kbid: str
+    ):
+        """
+        Fields generated by data augmentation tasks are sent back to the processor to be processed and indexed.
+        """
+        generated_fields = await get_generated_fields(message)
+        if generated_fields.is_not_empty():
+            await send_generated_fields_to_process(kbid, resource, generated_fields, message)
+
+    @processor_observer.wrap({"type": "txn"})
+    async def txn(
+        self,
+        message: writer_pb2.BrokerMessage,
+        seqid: int,
+        partition: str,
+        transaction_check: bool = True,
+    ) -> None:
+        kbid = message.kbid
+        kb_exists = await datamanagers.atomic.kb.exists(kbid=kbid)
+        uuid: str | None = None
+        if not kb_exists:
+            logger.info("Deleted KB: skipping txn", extra={"kbid": kbid})
+        else:
+            uuid = message.uuid or await datamanagers.atomic.resources.get_rid(
+                kbid=kbid, slug=message.slug
+            )
+            if not uuid:
+                logger.info(
+                    "Resource slug not found: skipping txn", extra={"kbid": kbid, "slug": message.slug}
+                )
+        if not kb_exists or not uuid:
+            if transaction_check:
+                async with datamanagers.with_rw_transaction() as txn:
+                    await sequence_manager.set_last_seqid(txn, partition, seqid)
+                    await txn.commit()
+            return None
+
+        async with (
+            locking.distributed_lock(locking.RESOURCE_LOCK.format(kbid=kbid, resource_id=uuid)),
+            self.driver.rw_transaction() as txn,
+        ):
+            logger.info(
+                "Processing message",
+                extra={"kbid": kbid, "rid": uuid, "seqid": seqid, "partition": partition},
+            )
+            try:
+                kb = KnowledgeBox(txn, self.storage, kbid)
+                resource: Resource | None = None
+                handled_exception = None
+                created = False
+
+                if message.source == writer_pb2.BrokerMessage.MessageSource.WRITER:
+                    resource = await kb.get(uuid)
+                    if resource is None:
+                        # It's a new resource
+                        resource = await kb.add_resource(uuid, message.slug, message.basic)
+                        created = True
+                    else:
+                        # It's an update from writer for an existing resource
+                        ...
+
+                elif message.source == writer_pb2.BrokerMessage.MessageSource.PROCESSOR:
+                    resource = await kb.get(uuid)
+                    if resource is None:
+                        logger.info(
+                            f"Processor message for resource received but the resource does not exist, ignoring.",
+                            extra={
+                                "kbid": kbid,
+                                "rid": uuid,
+                                "seqid": seqid,
+                            },
+                        )
+                        return None
+                    else:
+                        # It's an update from processor for an existing resource
+                        ...
+
+                    await self.handle_data_augmentation_fields(message, resource, kbid)
+
+                else:  # pragma: no cover
+                    raise InvalidBrokerMessage(f"Unknown broker message source: {message.source}")
+
+                # apply changes from the broker message to the fields and the resource
+                await self.apply_fields(message, resource)
+                await self.apply_resource(message, resource, new_resource=created)
+
+                # index message
+                if resource.modified:
+                    index_message = await self.generate_index_message(resource, message, created)
+                    try:
+                        warnings = await self.index_resource(
+                            index_message=index_message,
+                            txn=txn,
+                            uuid=uuid,
+                            kbid=kbid,
+                            seqid=seqid,
+                            partition=partition,
+                            kb=kb,
+                            source=to_index_message_source(message),
+                        )
+                        # Save indexing warnings
+                        for field_id, warning in warnings:
+                            await resource.add_field_error(
+                                field_id, warning, writer_pb2.Error.Severity.WARNING
+                            )
+                    except ResourceNotIndexable as e:
+                        await resource.add_field_error(
+                            e.field_id, e.message, writer_pb2.Error.Severity.ERROR
+                        )
+                        # After an index error, recompute and persist resource status
+                        basic = await resource.get_basic()
+                        await compute_resource_status(txn, kbid, uuid, basic)
+                        await resource.set_data(basic=basic)
+                        # Catalog takes status from index message labels, override it to error
+                        current_status = [x for x in index_message.labels if x.startswith("/n/s/")]
+                        if current_status:
+                            index_message.labels.remove(current_status[0])
+                            index_message.labels.append("/n/s/ERROR")
+
+                    await catalog_update(txn, kbid, resource, index_message)
+                    if transaction_check:
+                        await sequence_manager.set_last_seqid(txn, partition, seqid)
+                    await txn.commit()
+
+                    if created:
+                        await self.commit_slug(resource)
+
+                    await self.notify_commit(
+                        partition=partition,
+                        seqid=seqid,
+                        message=message,
+                        write_type=(
+                            writer_pb2.Notification.WriteType.CREATED
+                            if created
+                            else writer_pb2.Notification.WriteType.MODIFIED
+                        ),
+                    )
+                else:
+                    logger.info("This message did not modify the resource")
+                    await txn.abort()
+                    await self.notify_abort(
+                        partition=partition,
+                        seqid=seqid,
+                        kbid=kbid,
+                        rid=uuid,
+                        source=message.source,
+                    )
+            except (
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+                aiohttp.client_exceptions.ClientError,
+                ConflictError,
+                MaindbServerError,
+                nats.errors.NoRespondersError,
+                nats.js.errors.NoStreamResponseError,
+            ):  # pragma: no cover
+                # Unhandled exceptions here that should bubble and hard fail
+                # XXX We swallow too many exceptions here!
+                await self.notify_abort(
+                    partition=partition,
+                    seqid=seqid,
+                    kbid=kbid,
+                    rid=uuid,
+                    source=message.source,
+                )
+                raise
+            except Exception as exc:
+                # As we are in the middle of a transaction, we cannot let the exception raise directly
+                # as we need to do some cleanup. The exception will be reraised at the end of the function
+                # and then handled by the top caller, so errors can be handled in the same place.
+                logger.error(
+                    "Error processing message. Broker message stored in dead letter bucket.",
+                    exc_info=True,
+                    extra={"kbid": kbid, "rid": uuid, "seqid": seqid, "partition": partition},
+                )
+                await self.deadletter(message, partition, seqid)
+                await self.notify_abort(
+                    partition=partition,
+                    seqid=seqid,
+                    kbid=kbid,
+                    rid=uuid,
+                    source=message.source,
+                )
+                handled_exception = exc
+            finally:
+                if resource is not None:
+                    resource.clean()
+                # txn should be already commited or aborted, but in the event of an exception
+                # it could be left open. Make sure to close it if it's still open
+                if txn.open:
+                    await txn.abort()
+
+            if handled_exception is not None:
+                if seqid == -1:
+                    raise handled_exception
+                else:
+                    if resource is not None:
+                        await self._mark_resource_error(kb, resource)
+                    raise DeadletteredError() from handled_exception
+
+            return None
+
+    async def get_or_assign_resource_shard(
+        self, txn: Transaction, kb: KnowledgeBox, uuid: str
+    ) -> writer_pb2.ShardObject:
+        kbid = kb.kbid
+        shard_id = await datamanagers.resources.get_shard(txn, kbid=kbid, rid=uuid, for_update=True)
+        shard = None
+        if shard_id is not None:
+            # Resource already has a shard assigned
+            shard = await kb.get_resource_shard(shard_id)
+            if shard is None:
+                raise AttributeError("Shard not available")
+        else:
+            # It's a new resource, get KB's current active shard to place new resource on
+            shard = await self.index_node_shard_manager.get_current_active_shard(txn, kbid)
+            if shard is None:
+                # No current shard available, create a new one
+                async with locking.distributed_lock(locking.NEW_SHARD_LOCK.format(kbid=kbid)):
+                    kb_config = await datamanagers.kb.get_config(txn, kbid=kbid)
+                    prewarm = kb_config is not None and kb_config.prewarm_enabled
+                    shard = await self.index_node_shard_manager.create_shard_by_kbid(
+                        txn, kbid, prewarm_enabled=prewarm
+                    )
+            await datamanagers.resources.set(txn, kbid=kbid, rid=uuid, shard=shard.shard)
+        return shard
+
+    @processor_observer.wrap({"type": "index_resource"})
+    async def index_resource(
+        self,
+        index_message: PBBrainResource,
+        txn: Transaction,
+        uuid: str,
+        kbid: str,
+        seqid: int,
+        partition: str,
+        kb: KnowledgeBox,
+        source: nodewriter_pb2.IndexMessageSource.ValueType,
+    ) -> list[tuple[str, str]]:
+        validate_indexable_resource(index_message)
+        warnings = trim_entity_facets(index_message)
+
+        shard = await self.get_or_assign_resource_shard(txn, kb, uuid)
+        external_index_manager = await get_external_index_manager(kbid=kbid)
+        if external_index_manager is not None:
+            await self.external_index_add_resource(external_index_manager, uuid, index_message)
+        else:
+            await self.index_node_shard_manager.add_resource(
+                shard,
+                index_message,
+                seqid,
+                partition=partition,
+                kb=kbid,
+                source=source,
+            )
+        return warnings
+
+    @processor_observer.wrap({"type": "generate_index_message"})
+    async def generate_index_message(
+        self,
+        resource: Resource,
+        message: writer_pb2.BrokerMessage,
+        resource_created: bool,
+    ) -> PBBrainResource:
+        builder = IndexMessageBuilder(resource)
+        if message.source == writer_pb2.BrokerMessage.MessageSource.WRITER:
+            return await builder.for_writer_bm(message, resource_created)
+        elif message.source == writer_pb2.BrokerMessage.MessageSource.PROCESSOR:
+            return await builder.for_processor_bm(message)
+        else:  # pragma: no cover
+            raise InvalidBrokerMessage(f"Unknown broker message source: {message.source}")
+
+    async def external_index_delete_resource(
+        self, external_index_manager: ExternalIndexManager, resource_uuid: str
+    ):
+        if self.should_skip_external_index(external_index_manager):
+            logger.warning(
+                "Skipping external index delete resource",
+                extra={
+                    "kbid": external_index_manager.kbid,
+                    "rid": resource_uuid,
+                    "provider": external_index_manager.type.value,
+                },
+            )
+            return
+        await external_index_manager.delete_resource(resource_uuid=resource_uuid)
+
+    def should_skip_external_index(self, external_index_manager: ExternalIndexManager) -> bool:
+        """
+        This is a safety measure to skip external indexing in case that the external index provider is not working.
+        As we don't want to block the ingestion pipeline, this is a temporary measure until we implement async consumers
+        to index to external indexes.
+        """
+        kbid = external_index_manager.kbid
+        provider_type = external_index_manager.type.value
+        return has_feature(
+            const.Features.SKIP_EXTERNAL_INDEX,
+            context={"kbid": kbid, "provider": provider_type},
+            default=False,
+        )
+
+    async def external_index_add_resource(
+        self,
+        external_index_manager: ExternalIndexManager,
+        resource_uuid: str,
+        index_message: PBBrainResource,
+    ):
+        if not has_vectors_operation(index_message):
+            return
+        if self.should_skip_external_index(external_index_manager):
+            logger.warning(
+                "Skipping external index for resource",
+                extra={
+                    "kbid": external_index_manager.kbid,
+                    "rid": resource_uuid,
+                    "provider": external_index_manager.type.value,
+                },
+            )
+            return
+        await external_index_manager.index_resource(
+            resource_uuid=resource_uuid, resource_data=index_message
+        )
+
+    async def deadletter(self, message: writer_pb2.BrokerMessage, partition: str, seqid: int) -> None:
+        await self.storage.deadletter(message, 0, seqid, partition)
+
+    @processor_observer.wrap({"type": "apply_resource"})
+    async def apply_resource(
+        self,
+        message: writer_pb2.BrokerMessage,
+        resource: Resource,
+        new_resource: bool,
+    ):
+        """
+        Apply all resource-level metadata from the broker message: basic (including
+        all mutations derived from extracted data), origin, extra, security and
+        user relations.
+        """
+        # Load and update basic. For new resources basic was already set by
+        # kb.add_resource(); we still need to apply extracted-data mutations.
+        current_basic = await resource.get_basic()
+        previous_basic = PBBasic()
+        previous_basic.CopyFrom(current_basic)
+        resource._previous_status = current_basic.metadata.status
+
+        # Merge explicit basic payload for updates
+        if not new_resource and (message.HasField("basic") or len(message.delete_fields) > 0):
+            current_basic = _merge_basic(current_basic, message.basic, list(message.delete_fields))
+
+        # Apply all basic mutations derived from extracted data
+        filenames = await resource.get_filenames()
+        _apply_extracted_basic_updates(message, current_basic, resource.uuid, filenames)
+
+        # Field statuses are up-to-date (apply_fields ran first); fold the
+        # computed resource status into basic before persisting.
+        await compute_resource_status(resource.txn, resource.kbid, resource.uuid, current_basic)
+
+        await resource.set_data(
+            basic=current_basic if current_basic != previous_basic else None,
+            origin=message.origin if message.HasField("origin") else None,
+            extra=message.extra if message.HasField("extra") else None,
+            security=message.security if message.HasField("security") else None,
+        )
+
+        if message.HasField("user_relations"):
+            await resource.set_user_relations(message.user_relations)
+
+    @processor_observer.wrap({"type": "apply_fields"})
+    async def apply_fields(
+        self,
+        message: writer_pb2.BrokerMessage,
+        resource: Resource,
+    ):
+        """
+        Apply field content and extracted data from the broker message.
+        """
+        with processor_observer({"type": "apply_field_values"}):
+            await resource.apply_field_values(message)
+
+        with processor_observer({"type": "apply_field_extracted_data"}):
+            await resource.apply_field_extracted_data(message)
+
+    async def get_extended_audit_data(self, message: writer_pb2.BrokerMessage) -> writer_pb2.Audit:
+        message_audit = writer_pb2.Audit()
+        message_audit.CopyFrom(message.audit)
+        message_audit.kbid = message.kbid
+        message_audit.uuid = message.uuid
+        message_audit.message_source = message.source
+        message_audit.field_metadata.extend([fcmw.field for fcmw in message.field_metadata])
+        audit_fields = await collect_audit_fields(self.driver, self.storage, message)
+        message_audit.audit_fields.extend(audit_fields)
+        return message_audit
+
+    async def notify_commit(
+        self,
+        *,
+        partition: str,
+        seqid: int,
+        message: writer_pb2.BrokerMessage,
+        write_type: writer_pb2.Notification.WriteType.ValueType,
+    ):
+        message_audit = await self.get_extended_audit_data(message)
+        notification = writer_pb2.Notification(
+            partition=int(partition),
+            seqid=seqid,
+            multi="",
+            uuid=message.uuid,
+            kbid=message.kbid,
+            action=writer_pb2.Notification.Action.COMMIT,
+            write_type=write_type,
+            source=MESSAGE_TO_NOTIFICATION_SOURCE[message.source],
+            processing_errors=len(message.errors) > 0,
+            message_audit=message_audit,
+        )
+
+        await self.notify(
+            const.PubSubChannels.RESOURCE_NOTIFY.format(kbid=message.kbid),
+            notification.SerializeToString(),
+        )
+
+    async def notify_abort(
+        self,
+        *,
+        partition: str,
+        seqid: int,
+        kbid: str,
+        rid: str,
+        source: writer_pb2.BrokerMessage.MessageSource.ValueType,
+    ):
+        message = writer_pb2.Notification(
+            partition=int(partition),
+            seqid=seqid,
+            multi="",
+            uuid=rid,
+            kbid=kbid,
+            action=writer_pb2.Notification.ABORT,
+            source=MESSAGE_TO_NOTIFICATION_SOURCE[source],
+        )
+        await self.notify(
+            const.PubSubChannels.RESOURCE_NOTIFY.format(kbid=kbid),
+            message.SerializeToString(),
+        )
+
+    async def notify(self, channel, payload: bytes):
+        if self.pubsub is not None:
+            await self.pubsub.publish(channel, payload)
+
+    async def _mark_resource_error(self, kb: KnowledgeBox, resource: Resource | None) -> None:
+        """
+        Unhandled error processing, try to mark resource as error
+        """
+        if resource is None or resource.basic is None:
+            logger.info(f"Skip when resource does not even have basic metadata: {resource}")
+            return
+        try:
+            async with self.driver.rw_transaction() as txn:
+                kb.txn = resource.txn = txn
+                resource.basic.metadata.status = resources_pb2.Metadata.Status.ERROR
+                await resource.set_data(basic=resource.basic)
+                await txn.commit()
+        except Exception:
+            logger.warning("Error while marking resource as error", exc_info=True)
+
+    # KB tools
+    # XXX: Why are these utility functions here?
+    async def get_kb_obj(
+        self, txn: Transaction, kbid: knowledgebox_pb2.KnowledgeBoxID
+    ) -> KnowledgeBox | None:
+        uuid: str | None = kbid.uuid
+        if uuid == "":
+            uuid = await datamanagers.kb.get_kbid(txn, slug=kbid.slug)
+
+        if uuid is None:
+            return None
+
+        if not (await datamanagers.kb.exists(txn, kbid=uuid)):
+            return None
+
+        storage = await get_storage()
+        kbobj = KnowledgeBox(txn, storage, uuid)
+        return kbobj
+
+
+def to_index_message_source(message: writer_pb2.BrokerMessage):
+    if message.source == writer_pb2.BrokerMessage.MessageSource.WRITER:
+        return nodewriter_pb2.IndexMessageSource.WRITER
+    elif message.source == writer_pb2.BrokerMessage.MessageSource.PROCESSOR:
+        return nodewriter_pb2.IndexMessageSource.PROCESSOR
+    else:  # pragma: no cover
+        msg = f"Processor received a broker message with unexpected source! {message.source}"
+        logger.error(msg)
+        errors.capture_exception(Exception(msg))
+        return nodewriter_pb2.IndexMessageSource.PROCESSOR
+
+
+def has_vectors_operation(index_message: PBBrainResource) -> bool:
+    """
+    Returns True if the index message has any vectors to index or to delete.
+    """
+    if any([len(deletions.items) for deletions in index_message.vector_prefixes_to_delete.values()]):
+        return True
+    for field_paragraphs in index_message.paragraphs.values():
+        for paragraph in field_paragraphs.paragraphs.values():
+            if len(paragraph.sentences) > 0:
+                return True
+            for vectorset_sentences in paragraph.vectorsets_sentences.values():
+                if len(vectorset_sentences.sentences) > 0:
+                    return True
+    return False
+
+
+# Immutable basic fields that are already set should not be overwritten by incoming payloads.
+_BASIC_IMMUTABLE_FIELDS = ("icon",)
+
+
+def _merge_basic(
+    current: PBBasic,
+    payload: PBBasic,
+    deleted_fields: list[FieldID],
+) -> PBBasic:
+    """
+    Merge an incoming basic payload onto the existing basic, applying all
+    deduplication and immutability rules, then return the result ready to persist.
+    """
+    assert current.ByteSize(), "Expected an existing resource with non-empty basic"
+    merged = PBBasic()
+    merged.CopyFrom(current)
+
+    if merged != payload:
+        for field in _BASIC_IMMUTABLE_FIELDS:
+            # Immutable basic fields that are already set are cleared from
+            # the payload so that they are not overwritten.
+            if getattr(merged, field, "") != "":
+                payload.ClearField(field)  # type: ignore[arg-type]
+
+        merged.MergeFrom(payload)
+
+        # Prevent duplicated languages
+        unique_languages = set(merged.metadata.languages)
+        merged.metadata.ClearField("languages")
+        merged.metadata.languages.extend(unique_languages)
+
+        # Prevent duplicated labels
+        unique_labels = set(merged.labels)
+        merged.ClearField("labels")
+        merged.labels.extend(unique_labels)
+
+        # Update processing status: only overwrite when the payload signals
+        # that the resource is useful (i.e. coming from a real processing run).
+        if payload.HasField("metadata") and payload.metadata.useful:
+            merged.metadata.status = payload.metadata.status
+
+        # We force the usermetadata classifications to be exactly what the
+        # payload defines (no merging).
+        if payload.HasField("usermetadata"):
+            merged.usermetadata.CopyFrom(payload.usermetadata)
+
+        if len(payload.fieldmetadata):
+            # Keep only the last fieldmetadata item for each field. API
+            # users are responsible to manage fieldmetadata properly.
+            fields: list[str] = []
+            positions: dict[str, int] = {}
+            for i, fieldmetadata in enumerate(merged.fieldmetadata):
+                field_id = (
+                    f"{FIELD_TYPE_PB_TO_STR[fieldmetadata.field.field_type]}/{fieldmetadata.field.field}"
+                )
+                if field_id not in fields:
+                    fields.append(field_id)
+                positions[field_id] = i
+
+            updated = [merged.fieldmetadata[positions[f]] for f in fields]
+            del merged.fieldmetadata[:]
+            merged.fieldmetadata.extend(updated)
+
+    # Some basic fields are computed off field metadata.
+    # Recompute upon field deletions.
+    if deleted_fields:
+        delete_basic_computedmetadata_classifications(merged, deleted_fields=deleted_fields)
+
+    return merged
+
+
+def _should_reset_title(basic: PBBasic, resource_uuid: str) -> bool:
+    """
+    When a user creates a resource without a title, the system will try to set the title from
+    some extracted metadata like the title of a link field or the extracted title of a file field.
+    """
+    return basic.title in ("", resource_uuid) or basic.reset_title
+
+
+def _should_set_title_from_files(basic: PBBasic, resource_uuid: str, filenames: list[str]) -> bool:
+    return _should_reset_title(basic, resource_uuid) or basic.title in filenames
+
+
+def _should_set_title_from_link(basic: PBBasic, resource_uuid: str, extracted_title: str) -> bool:
+    return extracted_title != "" and (
+        _should_reset_title(basic, resource_uuid) or basic.title.startswith("http")
+    )
+
+
+def _apply_extracted_basic_updates(
+    message: writer_pb2.BrokerMessage,
+    basic: PBBasic,
+    resource_uuid: str,
+    filenames: list[str],
+) -> None:
+    """
+    Inspect the extracted-data sections of a broker message and apply all
+    side-effect mutations to basic (icon, thumbnail, summary, title, languages,
+    computed classifications). Does not persist — caller is responsible for that.
+    """
+    # Icon from text field format
+    maybe_update_basic_icon(basic, get_text_field_mimetype(message))
+
+    extracted_languages: list[str] = []
+
+    # Link extracted data
+    for led in message.link_extracted_data:
+        maybe_update_basic_thumbnail(basic, led.link_thumbnail, message.kbid)
+        maybe_update_basic_icon(basic, "application/stf-link")
+        maybe_update_basic_summary(basic, led.description)
+        extracted_languages.append(led.language)
+        # Update title from the first link that has one and current title looks auto-generated
+        if _should_set_title_from_link(basic, resource_uuid, led.title):
+            # FIXME: this doesn't properly index the new title. See sc-6088 for more details
+            basic.title = led.title
+            basic.reset_title = False
+
+    # File extracted data
+    for fed in message.file_extracted_data:
+        maybe_update_basic_icon(basic, fed.icon)
+        maybe_update_basic_thumbnail(basic, fed.file_thumbnail, message.kbid)
+        extracted_languages.append(fed.language)
+
+    # Update title from the first file that has one (if title looks auto-generated)
+    if _should_set_title_from_files(basic, resource_uuid, filenames):
+        for fed in message.file_extracted_data:
+            if fed.title:
+                basic.title = fed.title
+                basic.reset_title = False
+                break
+
+    # Field computed metadata
+    for fcmw in message.field_metadata:
+        maybe_update_basic_summary(basic, fcmw.metadata.metadata.summary)
+        maybe_update_basic_thumbnail(basic, fcmw.metadata.metadata.thumbnail, message.kbid)
+        update_basic_computedmetadata_classifications(basic, fcmw)
+        extracted_languages.extend(extract_field_metadata_languages(fcmw))
+
+    update_basic_languages(basic, extracted_languages)
+
+
+async def compute_resource_status(
+    txn: Transaction,
+    kbid: str,
+    uuid: str,
+    basic: PBBasic,
+) -> None:
+    """
+    Compute and set the resource-level processing status on basic by inspecting
+    the status of all individual fields.
+    """
+    field_ids = await datamanagers.fields.get_all_field_ids(txn, kbid=kbid, rid=uuid)
+    if field_ids is None:
+        # No fields, it is processed
+        basic.metadata.status = resources_pb2.Metadata.Status.PROCESSED
+        return
+
+    processed_fields = [f for f in field_ids.fields if is_processed_field(f)]
+    if not processed_fields:
+        # No processed fields, it is pending
+        basic.metadata.status = resources_pb2.Metadata.Status.PROCESSED
+        return
+
+    field_statuses = await datamanagers.fields.get_statuses(
+        txn, kbid=kbid, rid=uuid, fields=processed_fields
+    )
+
+    # If any field is processing -> PENDING
+    if any(f.status == writer_pb2.FieldStatus.Status.PENDING for f in field_statuses):
+        basic.metadata.status = resources_pb2.Metadata.Status.PENDING
+    # If we have any non-DA error -> ERROR
+    elif any(
+        f.status == writer_pb2.FieldStatus.Status.ERROR
+        and any(
+            e.source_error.severity == writer_pb2.Error.Severity.ERROR
+            and e.source_error.code != writer_pb2.Error.ErrorCode.DATAAUGMENTATION
+            for e in f.errors
+        )
+        for f in field_statuses
+    ):
+        basic.metadata.status = resources_pb2.Metadata.Status.ERROR
+    # Otherwise (everything processed or we only have DA errors) -> PROCESSED
+    else:
+        basic.metadata.status = resources_pb2.Metadata.Status.PROCESSED
+
+
+def is_processed_field(field: resources_pb2.FieldID) -> bool:
+    """
+    Title and summary fields are not considered processed fields
+    """
+    return field not in (
+        resources_pb2.FieldID(field="title", field_type=resources_pb2.FieldType.GENERIC),
+        resources_pb2.FieldID(field="summary", field_type=resources_pb2.FieldType.GENERIC),
+    )
+
+
+def delete_basic_computedmetadata_classifications(basic: PBBasic, deleted_fields: list[FieldID]) -> bool:
+    """
+    We keep a copy of field classifications computed by the processing engine at the basic object
+    so that users can easily access them without having to load the field metadata from the storage.
+
+    This funcion removes the field classifications for the fields that have been deleted.
+    Returns whether the basic was modified.
+    """
+    if len(deleted_fields) == 0:
+        # Nothing to delete
+        return False
+    new_field_classifications = [
+        fc for fc in basic.computedmetadata.field_classifications if fc.field not in deleted_fields
+    ]
+    if len(new_field_classifications) == len(basic.computedmetadata.field_classifications):
+        # No changes
+        return False
+
+    basic.computedmetadata.ClearField("field_classifications")
+    basic.computedmetadata.field_classifications.extend(new_field_classifications)
+    return True
+
+
+def maybe_update_basic_summary(basic: PBBasic, summary_text: str) -> bool:
+    if basic.summary or not summary_text:
+        return False
+    basic.summary = summary_text
+    return True
+
+
+def maybe_update_basic_icon(basic: PBBasic, mimetype: str | None) -> bool:
+    if basic.icon not in (None, "", "application/octet-stream", GENERIC_MIME_TYPE):
+        # Icon already set or detected
+        return False
+
+    if not mimetype:
+        return False
+
+    if not content_types.valid(mimetype):
+        logger.warning(
+            "Invalid mimetype. Skipping icon update.",
+            extra={"mimetype": mimetype, "rid": basic.uuid, "slug": basic.slug},
+        )
+        return False
+
+    basic.icon = mimetype
+    return True
+
+
+def maybe_update_basic_thumbnail(
+    basic: PBBasic, thumbnail: resources_pb2.CloudFile | None, kbid: str
+) -> bool:
+    if basic.thumbnail or thumbnail is None:
+        return False
+    basic.thumbnail = CloudLink.format_reader_download_uri(thumbnail.uri)
+    fix_kbid_in_thumbnail(basic, kbid)
+    return True
+
+
+def extract_field_metadata_languages(
+    field_metadata: resources_pb2.FieldComputedMetadataWrapper,
+) -> list[str]:
+    languages: set[str] = set()
+    languages.add(field_metadata.metadata.metadata.language)
+    for _, splitted_metadata in field_metadata.metadata.split_metadata.items():
+        languages.add(splitted_metadata.language)
+    return list(languages)
+
+
+PB_TEXT_FORMAT_TO_MIMETYPE = {
+    resources_pb2.FieldText.Format.PLAIN: "text/plain",
+    resources_pb2.FieldText.Format.HTML: "text/html",
+    resources_pb2.FieldText.Format.RST: "text/x-rst",
+    resources_pb2.FieldText.Format.MARKDOWN: "text/markdown",
+    resources_pb2.FieldText.Format.JSON: "application/json",
+    resources_pb2.FieldText.Format.KEEP_MARKDOWN: "text/markdown",
+    resources_pb2.FieldText.Format.JSONL: "application/x-ndjson",
+    resources_pb2.FieldText.Format.PLAIN_BLANKLINE_SPLIT: "text/plain+blankline",
+}
+
+
+def get_text_field_mimetype(bm: writer_pb2.BrokerMessage) -> str | None:
+    if len(bm.texts) == 0:
+        return None
+    text_format = next(iter(bm.texts.values())).format
+    return PB_TEXT_FORMAT_TO_MIMETYPE[text_format]
+
+
+def update_basic_languages(basic: writer_pb2.Basic, languages: list[str]) -> bool:
+    if len(languages) == 0:
+        return False
+
+    updated = False
+    for language in languages:
+        if not language:
+            continue
+
+        if basic.metadata.language == "":
+            basic.metadata.language = language
+            updated = True
+
+        if language not in basic.metadata.languages:
+            basic.metadata.languages.append(language)
+            updated = True
+
+    return updated
+
+
+def update_basic_computedmetadata_classifications(
+    basic: PBBasic, fcmw: resources_pb2.FieldComputedMetadataWrapper
+) -> bool:
+    """
+    We keep a copy of field classifications computed by the processing engine at the basic object
+    so that users can easily access them without having to load the field metadata from the storage.
+
+    This function updates the basic object with the new field computed metadata.
+    Returns whether the basic was modified.
+    """
+    some_deleted = delete_basic_computedmetadata_classifications(basic, [fcmw.field])
+
+    fcfs = resources_pb2.FieldClassifications()
+    fcfs.field.CopyFrom(fcmw.field)
+
+    some_added = False
+    if len(fcmw.metadata.metadata.classifications) > 0:
+        some_added = True
+        fcfs.classifications.extend(fcmw.metadata.metadata.classifications)
+
+    for split_id, split in fcmw.metadata.split_metadata.items():
+        if split_id not in fcmw.metadata.deleted_splits:
+            if len(split.classifications) > 0:
+                some_added = True
+                fcfs.classifications.extend(split.classifications)
+    if some_added:
+        basic.computedmetadata.field_classifications.append(fcfs)
+    return some_added or some_deleted
+
+
+def fix_kbid_in_thumbnail(basic: PBBasic, kbid: str):
+    if basic.thumbnail.startswith("/kb/") and not basic.thumbnail.startswith(f"/kb/{kbid}/"):
+        # Replace the kbid in the thumbnail if it doesn't match the current kbid. This is necessary for
+        # resources that have been backed up and we are restoring them to a different kbid.
+        parts = basic.thumbnail.split("/", 3)
+        parts[2] = kbid
+        basic.thumbnail = "/".join(parts)

@@ -1,0 +1,311 @@
+name: PyPI and Helm Releases
+
+on:
+  workflow_call:
+
+env:
+  GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/224545243904/locations/global/workloadIdentityPools/gh-nuclia/providers/gh-nuclia-provider"
+  GCP_SERVICE_ACCOUNT: "github-actions@nuclia-internal.iam.gserviceaccount.com"
+  ARTIFACT_REGISTRY_URL: oci://europe-west4-docker.pkg.dev/nuclia-internal/charts
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read # This is required for actions/checkout
+
+jobs:
+  build_wheels:
+    name: Build wheels
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Generate a token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.GHAPP_ID_NUCLIABOT }}
+          private-key: ${{ secrets.PK_GHAPP_NUCLIABOT }}
+          owner: nuclia
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: 3.15.0
+
+      - name: Setup env
+        run: |
+          pip install wheel
+          pip install -U twine
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set dependency versions in requirements
+        run: |
+          python bump.py --build=${{github.run_number}}
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: component_changes
+        with:
+          filters: |
+            nucliadb_protos:
+              - 'nucliadb_protos/**'
+            nucliadb_utils:
+              - 'nucliadb_utils/**'
+            nucliadb_models:
+              - 'nucliadb_models/**'
+            nucliadb_sdk:
+              - 'nucliadb_sdk/**'
+            nucliadb_dataset:
+              - 'nucliadb_dataset/**'
+            nucliadb_telemetry:
+              - 'nucliadb_telemetry/**'
+            nidx_protos:
+              - 'nidx/nidx_protos/**'
+              - 'nucliadb_protos/**'
+
+      # Install all packages we are going to release
+      - name: Install all packages
+        run: |
+          pip install -e ./nucliadb_protos/
+          pip install -e ./nidx/nidx_protos/
+          pip install -e ./nucliadb_telemetry/
+          pip install -e ./nucliadb_utils/
+          pip install -e ./nucliadb_models/
+          pip install -e ./nucliadb_sdk/
+          pip install -e ./nucliadb_dataset/
+          pip install -e ./nucliadb/
+
+      - name: Build wheels
+        run: pip wheel --no-deps -w dist ./nucliadb_protos/ ./nidx/nidx_protos/ ./nucliadb_utils/ ./nucliadb_models/ ./nucliadb_sdk/ ./nucliadb_telemetry ./nucliadb_dataset/ ./nucliadb/
+
+      - name: Upload to pypi
+        run: twine upload --verbose dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+  push-docker:
+    name: Build public docker image
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - runner: ubuntu-24.04
+            tag: amd64
+          - runner: ubuntu-24.04-arm
+            tag: arm64
+        image:
+          - name: nucliadb
+            dockerfile: Dockerfile.withbinding
+          - name: nidx
+            dockerfile: Dockerfile.nidx
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # We need to setup buildx to be able to cache with gha
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Login to DockerHub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get release version
+        id: version_step
+        run: |-
+          python bump.py --build=${{github.run_number}}
+          cargo update --manifest-path nidx/Cargo.toml nidx_binding
+          VERSION=`cat VERSION`
+          HASH=`git rev-parse --short HEAD`
+          echo "version_number=$VERSION" >> $GITHUB_OUTPUT
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - id: build
+        name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: nuclia/${{ matrix.image.name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: echo "${{ steps.build.outputs.digest }}" > /tmp/digest-${{ matrix.image.name }}-${{ matrix.arch.tag }}
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.image.name }}-${{ matrix.arch.tag }}
+          path: /tmp/digest-${{ matrix.image.name }}-${{ matrix.arch.tag }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-docker:
+    runs-on: ubuntu-latest
+    needs:
+      - push-docker
+    strategy:
+      matrix:
+        image:
+          - nucliadb
+          - nidx
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get release version
+        id: version_step
+        run: |-
+          python bump.py --build=${{github.run_number}}
+          cargo update --manifest-path nidx/Cargo.toml nidx_binding
+          VERSION=`cat VERSION`
+          HASH=`git rev-parse --short HEAD`
+          echo "version_number=$VERSION" >> $GITHUB_OUTPUT
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Login to DockerHub
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: >
+          docker buildx imagetools create
+          --tag nuclia/${{ matrix.image }}:latest
+          --tag nuclia/${{ matrix.image }}:${{ steps.version_step.outputs.version_number }}
+          --tag nuclia/${{ matrix.image }}:${{ steps.version_step.outputs.hash }}
+          $(printf 'nuclia/${{ matrix.image }}@%s ' $(cat *))
+
+  deploy:
+    name: Deploy Helm chart and trigger internal CI
+    runs-on: ubuntu-24.04
+    needs: push-docker
+
+    steps:
+      - name: Generate a token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.GHAPP_ID_NUCLIABOT }}
+          private-key: ${{ secrets.PK_GHAPP_NUCLIABOT }}
+          owner: nuclia
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Authenticate to Google Cloud
+        id: gcp-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: "${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}"
+          service_account: "${{ env.GCP_SERVICE_ACCOUNT }}"
+          token_format: access_token
+
+      - name: Login to Google Artifact Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: europe-west4-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-auth.outputs.access_token }}
+
+      - name: Calculate short sha
+        id: env-vars
+        run: |-
+          HASH=`git rev-parse --short HEAD`
+          echo "short_sha=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Set helm package image
+        id: version_step
+        run: |-
+          python bump.py --build=${{github.run_number}}
+          DOCKER_VERSION=`cat VERSION`
+
+          # Helm package versioning does not support '.postX'. Convert to '+postX'
+          HELM_VERSION=`echo $DOCKER_VERSION | sed 's/.post/-post/'`
+
+          # Update chart with versions
+          echo "HELM_VERSION=$HELM_VERSION"
+          echo "DOCKER_VERSION=$DOCKER_VERSION"
+          sed -i.bak "s#99999.99999.99999#$HELM_VERSION#" ./charts/nucliadb/Chart.yaml
+          sed -i.bak "s#88888.88888.88888#$DOCKER_VERSION#" ./charts/nucliadb/Chart.yaml
+
+          echo "helm_version=$HELM_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+
+      - name: Push helm package
+        run: |-
+          helm lint charts/nucliadb
+          helm package charts/nucliadb
+          helm push nucliadb-${{ steps.version_step.outputs.helm_version }}.tgz ${{ env.ARTIFACT_REGISTRY_URL }}
+
+      - name: Send to promotion queue
+        id: send-to-promo
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: nuclia/core-apps
+          event-type: promotions
+          client-payload: |-
+            {
+              "commit-sha": "${{ github.sha }}",
+              "components": [
+                {
+                  "chart-version": "${{ steps.version_step.outputs.helm_version }}",
+                  "component": "nucliadb-standalone",
+                  "component-type": "regional"
+                }
+              ],
+              "environment": "stage",
+              "promo_production": false,
+              "skip_argo_health": false,
+              "skip_promo_queue": false,
+              "slack_team": "S06B7JZMC76",
+              "team": "nucliadb",
+              "tests": {
+                "run-e2e": false,
+                "run-nuclia-e2e": false
+              }
+            }

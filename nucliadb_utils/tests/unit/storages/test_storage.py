@@ -1,0 +1,217 @@
+# Copyright 2021 Bosutech XXI S.L.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from math import ceil
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from nidx_protos.noderesources_pb2 import Resource as BrainResource
+from nidx_protos.noderesources_pb2 import ResourceID
+from nidx_protos.nodewriter_pb2 import IndexMessage
+
+from nucliadb_protos.resources_pb2 import CloudFile
+from nucliadb_utils.storages.local import LocalStorageField
+from nucliadb_utils.storages.storage import (
+    ObjectInfo,
+    Storage,
+    StorageField,
+    iter_and_add_size,
+    iter_in_chunk_size,
+)
+from nucliadb_utils.storages.utils import Range
+
+
+class TestStorageField:
+    @pytest.fixture
+    def storage(self):
+        yield AsyncMock(source=0)
+
+    @pytest.fixture
+    def field(self):
+        yield MagicMock(uri="uri")
+
+    @pytest.fixture
+    def storage_field(self, storage, field):
+        yield LocalStorageField(storage, "bucket", "fullkey", field)
+
+    async def test_delete(self, storage_field: StorageField, storage):
+        await storage_field.delete()
+        storage.delete_upload.assert_called_once_with("uri", "bucket")
+
+
+class StorageTest(Storage):
+    def __init__(self):
+        self.source = 0
+        self.field_klass = lambda: MagicMock()  # type: ignore[ty:invalid-assignment]
+        self.deadletter_bucket = "deadletter_bucket"
+        self.indexing_bucket = "indexing_bucket"
+        self.chunked_upload_object = AsyncMock()
+        self.upload_object = AsyncMock()
+        self.move = AsyncMock()
+
+    def get_bucket_name(self, kbid):
+        return "bucket"
+
+    async def iterate_objects(self, bucket, prefix, start: str | None = None):
+        yield ObjectInfo(name="uri")
+
+    async def download(self, bucket: str, key: str, range: Range | None = None):
+        br = BrainResource(labels=["label"])
+        yield br.SerializeToString()
+
+    async def create_kb(self, kbid):
+        return True
+
+    async def delete_kb(self, kbid):
+        return True
+
+    async def delete_upload(self, uri: str, bucket_name: str):  # type: ignore[override]
+        return True
+
+    async def initialize(self) -> None:
+        pass
+
+    async def finalize(self) -> None:
+        pass
+
+    async def schedule_delete_kb(self, kbid: str) -> bool:
+        return True
+
+    async def insert_object(self, bucket, key, data):
+        pass
+
+    async def create_bucket(self, bucket_name):
+        pass
+
+
+class TestStorage:
+    @pytest.fixture
+    def storage(self):
+        s = StorageTest()
+        s.delete_upload = AsyncMock()
+        yield s
+
+    async def test_delete_resource(self, storage: StorageTest):
+        await storage.delete_resource("bucket", "uri")
+        storage.delete_upload.assert_called_once_with("uri", "bucket")  # type: ignore[ty:unresolved-attribute]
+
+    async def test_indexing(self, storage: StorageTest):
+        msg = BrainResource(resource=ResourceID(uuid="uuid"))
+        await storage.indexing(msg, 1, "1", "kb", "shard")
+
+        storage.upload_object.assert_called_once_with(  # type: ignore[ty:unresolved-attribute]
+            "indexing_bucket", "index/kb/shard/uuid/1", msg.SerializeToString()
+        )
+
+    async def test_reindexing(self, storage: StorageTest):
+        msg = BrainResource(resource=ResourceID(uuid="uuid"))
+        await storage.reindexing(msg, "reindex_id", "1", "kb", "shard")
+
+        storage.upload_object.assert_called_once_with(  # type: ignore[ty:unresolved-attribute]
+            "indexing_bucket", "index/kb/shard/uuid/reindex_id", msg.SerializeToString()
+        )
+
+    async def test_get_indexing(self, storage: StorageTest):
+        im = IndexMessage()
+        im.node = "node"
+        im.shard = "shard"
+        im.txid = 0
+        assert isinstance(await storage.get_indexing(im), BrainResource)
+
+    async def test_get_indexing_storage_key(self, storage: StorageTest):
+        im = IndexMessage()
+        im.node = "node"
+        im.shard = "shard"
+        im.txid = 0
+        im.storage_key = "index/kb/uuid/1"
+        assert isinstance(await storage.get_indexing(im), BrainResource)
+
+    async def test_delete_indexing(self, storage: StorageTest):
+        im = IndexMessage()
+        im.node = "node"
+        im.txid = 0
+        im.storage_key = "index/kb/uuid/1"
+        await storage.delete_indexing(
+            resource_uid="resource_uid", txid=1, kb="kb", logical_shard="logical_shard"
+        )
+
+        storage.upload_object.assert_called_once()  # type: ignore[ty:unresolved-attribute]
+
+    async def test_download_pb(self, storage: StorageTest):
+        assert isinstance(
+            await storage.download_pb(LocalStorageField(storage, "bucket", "fullkey"), BrainResource),
+            BrainResource,
+        )
+
+    async def test_indexing_bucket_none_attributeerrror(self, storage: StorageTest):
+        storage.indexing_bucket = None
+        msg = BrainResource()
+        im = IndexMessage(node="node", shard="shard", txid=0)
+
+        with pytest.raises(AttributeError):
+            await storage.indexing(msg, 1, "1", "kb", "shard")
+
+        with pytest.raises(AttributeError):
+            await storage.reindexing(msg, "reindex_id", "1", "kb", "shard")
+
+        with pytest.raises(AttributeError):
+            await storage.get_indexing(im)
+
+        with pytest.raises(AttributeError):
+            await storage.delete_indexing(
+                resource_uid="resource_uid",
+                txid=1,
+                kb="kb",
+                logical_shard="logical_shard",
+            )
+
+
+async def testiter_and_add_size():
+    cf = CloudFile()
+
+    async def iter():
+        yield b"foo"
+        yield b"bar"
+
+    cf.size = 0
+    async for _ in iter_and_add_size(iter(), cf):
+        pass
+
+    assert cf.size == 6
+
+
+async def test_iter_in_chunk_size():
+    async def iterable(total_size, *, chunk_size=1):
+        data = b"0" * total_size
+        for i in range(ceil(total_size / chunk_size)):
+            chunk = data[i * chunk_size : (i + 1) * chunk_size]
+            yield chunk
+
+    chunks = [chunk async for chunk in iter_in_chunk_size(iterable(10), chunk_size=4)]
+    assert len(chunks) == 3
+    assert len(chunks[0]) == 4
+    assert len(chunks[1]) == 4
+    assert len(chunks[2]) == 2
+
+    chunks = [chunk async for chunk in iter_in_chunk_size(iterable(0), chunk_size=4)]
+    assert len(chunks) == 0
+
+    # Try with an iterable that yields chunks bigger than the chunk size
+    chunks = [
+        chunk async for chunk in iter_in_chunk_size(iterable(total_size=12, chunk_size=10), chunk_size=4)
+    ]
+    assert len(chunks) == 3
+    assert len(chunks[0]) == 4
+    assert len(chunks[1]) == 4
+    assert len(chunks[2]) == 4

@@ -1,0 +1,122 @@
+---
+{{- if .Values.configMap.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapName | default "nucliadb-config" }}
+  labels:
+    app: shared
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+data:
+{{- if .Values.running.debug }}
+  DEBUG: "true"
+{{- end }}
+  RUNNING_ENVIRONMENT: {{ .Values.running.running_environment }}
+  LOG_LEVEL: {{ .Values.running.log_level }}
+  CORS: {{ toJson .Values.http.cors | quote }}
+  FILE_BACKEND: {{ .Values.storage.file_backend }}
+  UPLOAD_TOKEN_EXPIRATION: {{ .Values.storage.upload_token_expiration | quote}}
+{{- if eq .Values.storage.file_backend "gcs" }}
+  GCS_BUCKET: {{ .Values.storage.gcs_bucket }}
+  GCS_DEADLETTER_BUCKET: {{ .Values.storage.gcs_deadletter_bucket }}
+  GCS_INDEXING_BUCKET: {{ .Values.storage.gcs_indexing_bucket }}
+  GCS_LOCATION: {{ .Values.storage.gcs_location }}
+  GCS_PROJECT: {{ .Values.storage.gcs_project }}
+  GCS_BUCKET_LABELS: {{ toJson .Values.storage.gcs_bucket_labels | quote }}
+{{- else if eq .Values.storage.file_backend "s3" }}
+{{- with .Values.storage.s3_endpoint }}
+  S3_ENDPOINT: {{ . }}
+{{- end }}
+  S3_SSL: {{ .Values.storage.s3_ssl | quote }}
+  S3_VERIFY_SSL: {{ .Values.storage.s3_verify_ssl | quote }}
+{{- with .Values.storage.s3_verify_ssl_certificate }}
+  S3_VERIFY_SSL_CERTIFICATE: {{ . | quote }}
+{{- end }}
+  S3_MAX_POOL_CONNECTIONS: {{ .Values.storage.s3_max_pool_connections | quote }}
+  S3_REGION_NAME: {{ .Values.storage.s3_region_name }}
+  S3_BUCKET: {{ .Values.storage.s3_bucket }}
+  S3_BUCKET_TAGS: {{ toJson .Values.storage.s3_bucket_tags | quote }}
+  S3_DEADLETTER_BUCKET: {{ .Values.storage.s3_deadletter_bucket }}
+  S3_INDEXING_BUCKET: {{ .Values.storage.s3_indexing_bucket }}
+  S3_PATH_STYLE_ADDRESSING: {{ .Values.storage.s3_path_style_addressing | quote }}
+  S3_DISABLE_CHECKSUMS: {{ .Values.storage.s3_disable_checksums | quote }}
+{{- with .Values.storage.s3_kms_key_id }}
+  S3_KMS_KEY_ID: {{ . }}
+{{- end }}
+
+{{- else if eq .Values.storage.file_backend "azure" }}
+  AZURE_ACCOUNT_URL: {{ .Values.storage.azure_account_url }}
+  AZURE_DEADLETTER_BUCKET: {{ .Values.storage.azure_deadletter_bucket }}
+  AZURE_INDEXING_BUCKET: {{ .Values.storage.azure_indexing_bucket }}
+{{- with .Values.storage.azure_kb_account_url }}
+  AZURE_KB_ACCOUNT_URL: {{ . }}
+{{- end }}
+{{- end }}
+{{- if .Values.nuclia.onprem }}
+  NUCLIA_SERVICE_ACCOUNT: {{ .Values.nuclia.nuclia_service_account }}
+{{- end }}
+  NUCLIA_PUBLIC_URL: {{ .Values.nuclia.nuclia_public_url }}
+  NUCLIA_ZONE: {{ .Values.nuclia.nuclia_zone }}
+{{- if .Values.nuclia.onprem }}
+  ONPREM: "True"
+{{- else }}
+  ONPREM: "False"
+{{- end }}
+  NUCLIA_HASH_SEED: {{ .Values.nuclia.nuclia_hash_seed | quote }}
+  NUCLIA_PARTITIONS: {{ .Values.nuclia.nuclia_partitions | quote }}
+  NUCLIADB_INGEST: {{ .Values.nucliadb.ingest }}
+  CACHE_PUBSUB_NATS_URL: {{ toJson .Values.cache.cache_pubsub_nats_url |quote }}
+{{- with .Values.cache.cache_pubsub_nats_auth }}
+  CACHE_PUBSUB_NATS_AUTH: {{ . }}
+{{- end}}
+{{- with .Values.transaction.transaction_jetstream_auth }}
+  TRANSACTION_JETSTREAM_AUTH: {{ . }}
+{{- end}}
+  TRANSACTION_JETSTREAM_SERVERS: {{ toJson .Values.transaction.transaction_jetstream_servers | quote }}
+{{- with .Values.indexing.index_jetstream_auth }}
+  INDEX_JETSTREAM_AUTH: {{ . }}
+{{- end}}
+  INDEX_JETSTREAM_SERVERS: {{ toJson .Values.indexing.index_jetstream_servers | quote }}
+  DRIVER: {{ .Values.maindb.driver }}
+  AUDIT_DRIVER: {{ .Values.audit.driver }}
+  AUDIT_JETSTREAM_TARGET: {{ .Values.audit.audit_jetstream_target }}
+  AUDIT_JETSTREAM_SERVERS: {{ toJson .Values.audit.audit_jetstream_servers | quote }}
+{{- with .Values.audit.audit_jetstream_auth }}
+  AUDIT_JETSTREAM_AUTH: {{ . }}
+{{- end}}
+  AUDIT_PARTITIONS: {{ .Values.audit.audit_partitions | quote }}
+  AUDIT_HASH_SEED: {{ .Values.audit.audit_hash_seed | quote }}
+  JAEGER_AGENT_HOST: "{{ .Values.tracing.jaeger_agent_host }}"
+  JAEGER_AGENT_PORT: "{{ .Values.tracing.jaeger_agent_thrift_compact_port }}"
+  JAEGER_QUERY_HOST: "{{ .Values.tracing.jaeger_query_host }}"
+  JAEGER_QUERY_PORT: "{{ .Values.tracing.jaeger_query_http_port }}"
+  JAEGER_PROPAGATION: "jaeger,b3,w3c"
+  OTEL_EXPORTER_JAEGER_AGENT_SPLIT_OVERSIZED_BATCHES: "1"
+
+{{- if not .Values.telemetry.enabled }}
+  NUCLIADB_DISABLE_ANALYTICS: "True"
+{{- end }}
+
+{{- if .Values.flipt_server_url }}
+  FLIPT_SERVER_URL: "{{ .Values.flipt_server_url }}"
+{{- end }}
+
+{{- if .Values.flag_settings_url }}
+  FLAG_SETTINGS_URL: "{{ .Values.flag_settings_url }}"
+{{- end }}
+
+{{- with .Values.nidx }}
+  NIDX_ENABLED: "1"
+  INDEX_NIDX_SUBJECT: "{{ .nats_subject }}"
+  NIDX_API_ADDRESS: "{{ .api_address }}"
+  NIDX_SEARCHER_ADDRESS: "{{ .searcher_address }}"
+{{- end }}
+
+{{- range $key, $value := .Values.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
+{{- end }}
+
+{{- end }}

@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nucliadb
+  labels:
+    app: nucliadb
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: nucliadb
+      release: "{{ .Release.Name }}"
+      heritage: "{{ .Release.Service }}"
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      name: nucliadb
+      labels:
+        app: nucliadb
+        app.kubernetes.io/name: node
+        appType: node
+        version: "{{ .Chart.Version | replace "+" "_" }}"
+        chart: "{{ .Chart.Name }}"
+        release: "{{ .Release.Name }}"
+        heritage: "{{ .Release.Service }}"
+    spec:
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+      topologySpreadConstraints:
+{{ toYaml .Values.topologySpreadConstraints | indent 8 }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+      dnsPolicy: ClusterFirst
+{{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+{{- end }}
+      serviceAccountName: {{ if kindIs "string" .Values.serviceAccount }}{{ .Values.serviceAccount }}{{ else }}{{ .Values.serviceAccount.name | default "default" }}{{ end }}
+      containers:
+      - name: app
+        image: "{{ .Values.image }}:{{ .Values.imageVersion | default .Chart.AppVersion }}"
+        securityContext:
+          privileged: false
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /api/v1/health/alive
+            port: 8080
+          initialDelaySeconds: 20
+          timeoutSeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /api/v1/health/ready
+            port: 8080
+          initialDelaySeconds: 1
+          timeoutSeconds: 10
+          periodSeconds: 20
+        command: [
+          "nucliadb"
+        ]
+        env:
+          - name: VERSION
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['version']
+          {{- range $key, $value := .Values.env }}
+          - name: "{{ $key }}"
+            value: {{ tpl $value $ | toJson }}
+          {{- end }}
+          {{- if .Values.envSecrets }}
+{{ toYaml .Values.envSecrets | indent 10 }}
+          {{- end }}
+          - name: standalone_node_role
+            value: "index"
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        {{- if .Values.envFrom }}
+        envFrom:
+          {{- toYaml .Values.envFrom | nindent 10 }}
+        {{- end }}
+        ports:
+        - name: http
+          containerPort: 8080
+        - name: train
+          containerPort: 8040
+        - name: grpc
+          containerPort: 8060
+        - name: node
+          containerPort: 10009
+        resources:
+{{ toYaml .Values.resources | indent 10 }}

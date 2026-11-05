@@ -1,0 +1,45 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: statefulset-viewer
+  labels:
+    app: ingest
+    app.kubernetes.io/name: ingest
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - statefulsets
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: statefulset-viewer
+  labels:
+    app: ingest
+    app.kubernetes.io/name: ingest
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: statefulset-viewer
+subjects:
+- kind: ServiceAccount
+  name: {{ if kindIs "string" .Values.purgeCron.serviceAccount }}{{ .Values.purgeCron.serviceAccount }}{{ else }}{{ .Values.purgeCron.serviceAccount.name | default "default" }}{{ end }}
+  namespace: {{ .Release.Namespace }}

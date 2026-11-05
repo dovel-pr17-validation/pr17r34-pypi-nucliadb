@@ -1,0 +1,15 @@
+[report]
+exclude_lines =
+    pragma: no cover
+    # blank implementations with ...
+    ^\s*\.\.\.\s*$
+    # abstract methods and properties
+    raise NotImplementedError
+    @(abc\.)?abstract
+    # main functions
+    if __name__ == .__main__.:
+
+[run]
+omit =
+    *setup.py
+    */tests/*

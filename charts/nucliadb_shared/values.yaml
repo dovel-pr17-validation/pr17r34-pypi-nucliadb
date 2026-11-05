@@ -1,0 +1,123 @@
+# Chart configuration
+
+configMap:
+  create: true
+  # name: nucliadb-config
+secret:
+  create: true
+  # name: nucliadb-config
+
+# NucliaDB Settings
+
+running:
+  debug: False
+  log_level: DEBUG
+  running_environment: local
+
+http:
+  cors:
+    - http://localhost:4200
+
+maindb:
+  driver: pg
+  driver_pg_url:
+
+storage:
+  file_backend: gcs
+
+  # gcs_base64_creds: XX
+  gcs_bucket: nucliadb_{kbid}
+  gcs_location: XX
+  gcs_project: XX
+  gcs_bucket_labels:
+  gcs_deadletter_bucket: XX
+  gcs_indexing_bucket: XX
+
+  s3_irsa: disabled
+  s3_client_id: XX
+  s3_client_secret: XX
+  s3_ssl: True
+  s3_verify_ssl: True
+  s3_verify_ssl_certificate: null
+  s3_max_pool_connections: 30
+  s3_region_name: XX
+  s3_bucket: nucliadb-{kbid}
+  s3_bucket_tags:
+  s3_deadletter_bucket: XX
+  s3_indexing_bucket: XX
+  s3_path_style_addressing: False
+  s3_disable_checksums: False
+
+  azure_account_url: XX
+  azure_deadletter_bucket: XX
+  azure_indexing_bucket: XX
+  # azure_kb_account_url: XX
+
+  upload_token_expiration: 0
+
+nuclia:
+  nuclia_service_account: XX
+  nuclia_public_url: https://{zone}.nuclia.cloud
+  nuclia_cluster_url: http://nucliadb_proxy.processing.svc.cluster.local
+  nuclia_zone: XX
+  onprem: XX
+  nuclia_jwt_key: XX
+  nuclia_hash_seed: 42
+  nuclia_partitions: 1
+
+nucliadb:
+  ingest: ingest-orm-grpc:8030
+
+transaction:
+  transaction_jetstream_auth:
+  transaction_jetstream_servers:
+    - nats1
+
+indexing:
+  index_jetstream_auth:
+  index_jetstream_servers:
+    - nats1
+
+cache:
+  cache_pubsub_nats_url:
+    - nats1
+  cache_pubsub_nats_auth:
+
+audit:
+  driver: basic
+  audit_jetstream_target: "audit.{partition}.{type}"
+  audit_jetstream_servers:
+    - nats1
+  audit_jetstream_auth:
+  audit_partitions: 1
+  audit_hash_seed: 1234
+
+tracing:
+  jaeger_agent_host: localhost
+  jaeger_agent_thrift_compact_port: 6831
+  jaeger_query_host: query.tracing.svc.cluster.local
+  jaeger_query_http_port: 16686
+
+telemetry:
+  enabled: True
+
+flag_settings_url: null
+flipt_server_url: null
+
+encryption:
+  secret_key: XX
+
+# -- Extra environment variables to be added into the configmap --
+extraEnv: {}
+  # EXTRA_ENV_VAR_1: value1
+  # EXTRA_ENV_VAR_2: value2
+
+# -- Extra sensitive environment variables to be added into the secret --
+extraSecretEnv: {}
+  # EXTRA_SENSITIVE_VAR_1: value1
+  # EXTRA_SENSITIVE_VAR_2: value2
+
+# nidx:
+#   api_address:
+#   searcher_address:
+#   nats_subject:

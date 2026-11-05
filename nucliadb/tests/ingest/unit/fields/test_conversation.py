@@ -1,0 +1,225 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+from unittest import mock
+
+import pytest
+
+from nucliadb.common import datamanagers
+from nucliadb.common.maindb.driver import Driver, Transaction
+from nucliadb.ingest.fields.conversation import Conversation
+from nucliadb.ingest.orm.knowledgebox import KnowledgeBox
+from nucliadb.ingest.orm.resource import Resource
+from nucliadb_protos.resources_pb2 import CloudFile, FieldConversation
+from nucliadb_protos.resources_pb2 import Conversation as PBConversation
+from nucliadb_protos.resources_pb2 import Message as PBMessage
+from nucliadb_protos.resources_pb2 import MessageContent as PBMessageContent
+
+
+@pytest.fixture(scope="function")
+async def txn(maindb_driver: Driver):
+    async with maindb_driver.rw_transaction() as txn:
+        yield txn
+
+
+@pytest.fixture(scope="function")
+async def kbid(maindb_driver: Driver):
+    kbid = KnowledgeBox.new_unique_kbid()
+    async with maindb_driver.rw_transaction() as txn:
+        await datamanagers.kb.set_slug(txn, kbid=kbid, slug=f"slug-{kbid}")
+        await txn.commit()
+    return kbid
+
+
+@pytest.fixture(scope="function")
+def storage():
+    storage = mock.AsyncMock()
+    storage.needs_move = mock.Mock(return_value=False)
+    yield storage
+
+
+@pytest.fixture(scope="function")
+async def resource(maindb_driver: Driver, txn: Transaction, storage, kbid: str):
+    rid = Resource.new_unique_rid()
+    async with maindb_driver.rw_transaction() as txn:
+        await datamanagers.resources.set_slug(txn, kbid=kbid, rid=rid, slug=f"slug-{rid}")
+        await txn.commit()
+
+    resource = mock.AsyncMock()
+    resource.modified = False
+    resource.txn = txn
+    resource.storage = storage
+    resource.kbid = kbid
+    resource.uuid = rid
+    yield resource
+
+
+async def test_get_metadata(resource):
+    conv = Conversation("faq", resource)
+    assert conv.value == {}
+    assert conv.metadata is None
+
+    metadata = await conv.get_metadata()
+    assert metadata is None
+
+    metadata = FieldConversation()
+    metadata.size == 200
+    metadata.pages = 1
+    metadata.total = 10
+
+    await conv.db_set_metadata(metadata)
+    assert conv.metadata == metadata
+    assert conv.resource.modified is True
+
+    # Check it is cached
+    assert await conv.get_metadata() == metadata
+
+    # Force reload
+    conv.metadata = None
+    assert await conv.get_metadata() == metadata
+
+
+def get_cf(uri):
+    cf = CloudFile(uri=uri)
+    cf.filename = "foo.txt"
+    cf.size = 100
+    cf.content_type = "text/plain"
+    cf.bucket_name = "bucket"
+    return cf
+
+
+def get_message(id, who, to, text, attachments=None):
+    msg = PBMessage(ident=id, who=who)
+
+    if not isinstance(to, list):
+        to = [to]
+
+    msg.to.extend(to)
+    msg.timestamp.GetCurrentTime()
+    msg.content.text = text
+    msg.content.format = PBMessageContent.Format.PLAIN
+    for attachment in attachments or []:
+        msg.content.attachments.append(attachment)
+
+    return msg
+
+
+async def test_get_value(resource):
+    conv = Conversation("faq", resource)
+
+    cf = get_cf("gs://bucket/foo.txt")
+    msg1 = get_message("m1", "person", "computer", "What is the meaning of life?", [cf])
+    msg2 = get_message("m2", "computer", "person", "42")
+
+    payload = PBConversation()
+    payload.messages.extend([msg1, msg2])
+
+    await conv.set_value(payload)
+
+    metadata = await conv.get_metadata()
+    assert metadata is not None
+    assert metadata.size == 200
+    assert metadata.pages == 1
+    assert metadata.total == 2
+
+    payload = PBConversation()
+    for i in range(300):
+        msg = get_message(str(i), "person", "computer", "What is the meaning of life?")
+        payload.messages.append(msg)
+
+    await conv.set_value(payload)
+
+    conv.metadata = None
+    metadata = await conv.get_metadata()
+    assert metadata is not None
+    assert metadata.size == 200
+    assert metadata.pages == 2
+    assert metadata.total == 302
+
+    # Pages start at 1
+    assert await conv.get_value() is None
+    assert await conv.get_value(page=0) is None
+
+    for force_reload in [True, False]:
+        if force_reload:
+            conv.metadata = None
+            conv.value = {}
+
+        page1 = await conv.get_value(page=1)
+        assert page1
+        assert len(page1.messages) == 200
+        assert [m.ident for m in page1.messages] == ["m1", "m2"] + [str(i) for i in range(198)]
+
+        page2 = await conv.get_value(page=2)
+        assert page2
+        assert len(page2.messages) == 102
+        assert [m.ident for m in page2.messages] == [str(i) for i in range(198, 300)]
+
+
+async def test_replace_field_starts_at_page_1(resource):
+    """Regression: replace_field=True must not leave page 1 missing.
+
+    Before the fix, delete_value() cleared kb_conversations but left the stale
+    FieldConversation row (pages=N) in kb_fields.  A subsequent set_value then
+    fetched that stale metadata, hit PageNotFound for the last page, and
+    incremented pages to N+1, so new messages landed on page 2 with page 1
+    never written.
+    """
+    conv = Conversation("faq", resource)
+
+    # Initial write: 1 page, 2 messages.
+    initial = PBConversation()
+    initial.messages.extend(
+        [
+            get_message("m1", "user", "bot", "hello"),
+            get_message("m2", "bot", "user", "hi"),
+        ]
+    )
+    await conv.set_value(initial)
+
+    metadata = await conv.get_metadata()
+    assert metadata is not None
+    assert metadata.pages == 1
+
+    # Simulate reprocessing: replace_field=True replaces all previous content.
+    replacement = PBConversation()
+    replacement.replace_field = True
+    replacement.messages.extend(
+        [
+            get_message("r1", "user", "bot", "new hello"),
+            get_message("r2", "bot", "user", "new hi"),
+        ]
+    )
+    # Reset in-memory cache so set_value re-fetches metadata from DB.
+    conv.metadata = None
+    conv.value = {}
+    conv._splits_metadata = None
+    await conv.set_value(replacement)
+
+    metadata = await conv.get_metadata()
+    assert metadata is not None
+    assert metadata.pages == 1, f"expected pages=1 after replace_field, got {metadata.pages}"
+    assert metadata.total == 2
+
+    page1 = await conv.get_value(page=1)
+    assert page1 is not None, "page 1 is missing after replace_field"
+    assert [m.ident for m in page1.messages] == ["r1", "r2"]
+
+    page2 = await conv.get_value(page=2)
+    assert page2 is None, "unexpected page 2 after replace_field with only 2 messages"

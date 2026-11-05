@@ -1,0 +1,29 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: train
+spec:
+  gateways:
+    - "{{ .Values.vs.gateway }}"
+  hosts:
+    - "{{ .Values.zone }}.{{ .Values.vs.host }}"
+  http:
+    - name: nucliadb_train
+      match:
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/trainset$'
+          method:
+            regex: "GET|POST|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/trainset/[^/]+$'
+          method:
+            regex: "GET|POST|OPTIONS"
+
+      retries:
+        attempts: 3
+        retryOn: connect-failure
+      route:
+        - destination:
+            port:
+              number: {{.Values.serving.port}}
+            host: "train.{{ .Release.Namespace }}.svc.cluster.local"

@@ -1,0 +1,782 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+from collections import deque
+from collections.abc import AsyncIterator, Sequence
+from typing import Deque, assert_never, cast
+
+from nucliadb.common.ids import FieldId
+from nucliadb.common.models_utils import from_proto
+from nucliadb.ingest.fields.base import Field
+from nucliadb.ingest.fields.conversation import Conversation
+from nucliadb.ingest.fields.file import File
+from nucliadb.ingest.fields.generic import Generic
+from nucliadb.ingest.fields.key_value import KeyValue
+from nucliadb.ingest.fields.link import Link
+from nucliadb.ingest.fields.text import Text
+from nucliadb.ingest.orm.resource import Resource
+from nucliadb.models.internal.augment import (
+    AnswerSelector,
+    AugmentedConversationField,
+    AugmentedConversationMessage,
+    AugmentedField,
+    AugmentedFileField,
+    AugmentedGenericField,
+    AugmentedKeyValueField,
+    AugmentedLinkField,
+    AugmentedTextField,
+    ConversationAnswerOrAfter,
+    ConversationAttachments,
+    ConversationProp,
+    ConversationSelector,
+    ConversationText,
+    FieldClassificationLabels,
+    FieldEntities,
+    FieldProp,
+    FieldText,
+    FieldValue,
+    FileProp,
+    FileThumbnail,
+    FullSelector,
+    MessageSelector,
+    MessagesSelector,
+    NeighboursSelector,
+    PageSelector,
+    WindowSelector,
+)
+from nucliadb.search.augmentor.metrics import augmentor_observer
+from nucliadb.search.augmentor.resources import get_basic
+from nucliadb.search.search import cache
+from nucliadb_models.common import FieldTypeName
+from nucliadb_protos import resources_pb2
+from nucliadb_utils.storages.storage import STORAGE_FILE_EXTRACTED
+
+from .extracted_text import nidx_et_cache
+
+# Number of messages to pull after a match in a message
+# The hope here is it will be enough to get the answer to the question.
+CONVERSATION_MESSAGE_CONTEXT_EXPANSION = 15
+
+
+@augmentor_observer.wrap({"type": "field"})
+async def augment_field(
+    kbid: str,
+    field_id: FieldId,
+    select: Sequence[FieldProp | FileProp | ConversationProp],
+) -> AugmentedField | None:
+    rid = field_id.rid
+    resource = await cache.get_resource(kbid, rid)
+    if resource is None:
+        # skip resources that aren't in the DB
+        return None
+    # Skip the field existence check: the field will exist in the vast majority of cases, and any
+    # missing metadata from stale deletions is handled gracefully downstream by db_augment_field.
+    field = await resource.get_field(field_id.key, field_id.pb_type, load=False)
+    return await db_augment_field(field, field_id, select)
+
+
+async def db_augment_field(
+    field: Field,
+    field_id: FieldId,
+    select: Sequence[FieldProp | FileProp | ConversationProp],
+) -> AugmentedField:
+    select = dedup_field_select(select)
+
+    field_type = field_id.type
+
+    # Note we cast `select` to the specific Union type required by the
+    # db_augment_ function. This is safe even if there are props that are not
+    # for a specific field, as they will be ignored
+
+    if field_type == FieldTypeName.TEXT.abbreviation():
+        field = cast(Text, field)
+        select = cast(list[FieldProp], select)
+        return await db_augment_text_field(field, field_id, select)
+
+    elif field_type == FieldTypeName.FILE.abbreviation():
+        field = cast(File, field)
+        select = cast(list[FileProp], select)
+        return await db_augment_file_field(field, field_id, select)
+
+    elif field_type == FieldTypeName.LINK.abbreviation():
+        field = cast(Link, field)
+        select = cast(list[FieldProp], select)
+        return await db_augment_link_field(field, field_id, select)
+
+    elif field_type == FieldTypeName.CONVERSATION.abbreviation():
+        field = cast(Conversation, field)
+        select = cast(list[ConversationProp], select)
+        return await db_augment_conversation_field(field, field_id, select)
+
+    elif field_type == FieldTypeName.GENERIC.abbreviation():
+        field = cast(Generic, field)
+        select = cast(list[FieldProp], select)
+        return await db_augment_generic_field(field, field_id, select)
+
+    elif field_type == FieldTypeName.KEY_VALUE.abbreviation():
+        field = cast(KeyValue, field)
+        return await db_augment_key_value_field(field)
+
+    else:  # pragma: no cover
+        assert False, f"unknown field type: {field_type}"
+
+
+def dedup_field_select(
+    select: Sequence[FieldProp | FileProp | ConversationProp],
+) -> Sequence[FieldProp | FileProp | ConversationProp]:
+    """Merge any duplicated property taking the broader augmentation possible."""
+    merged = {}
+
+    # TODO(decoupled-ask): deduplicate conversation props.
+    #
+    # Note that only conversation properties can be deduplicated (none of the
+    # others have any field). However, deduplicating the selector is not
+    # possible in many cases, so we do nothing
+    unmergeable = []
+
+    for prop in select:
+        if prop.prop not in merged:
+            merged[prop.prop] = prop
+
+        else:
+            if isinstance(prop, ConversationText) or isinstance(prop, ConversationAttachments):
+                unmergeable.append(prop)
+            elif (
+                isinstance(prop, FieldText)
+                or isinstance(prop, FieldValue)
+                or isinstance(prop, FieldClassificationLabels)
+                or isinstance(prop, FieldEntities)
+                or isinstance(prop, FileThumbnail)
+                or isinstance(prop, ConversationAnswerOrAfter)
+            ):
+                # properties without parameters
+                pass
+            else:  # pragma: no cover
+                assert_never(prop)
+
+    return [*merged.values(), *unmergeable]
+
+
+@augmentor_observer.wrap({"type": "db_text_field"})
+async def db_augment_text_field(
+    field: Text,
+    field_id: FieldId,
+    select: Sequence[FieldProp],
+) -> AugmentedTextField:
+    augmented = AugmentedTextField(id=field.field_id)
+
+    for prop in select:
+        if isinstance(prop, FieldText):
+            augmented.text = await get_field_extracted_text(field_id, field)
+
+        elif isinstance(prop, FieldClassificationLabels):
+            augmented.classification_labels = await classification_labels(field_id, field.resource)
+
+        elif isinstance(prop, FieldEntities):
+            augmented.entities = await field_entities(field_id, field)
+
+        # text field props
+
+        elif isinstance(prop, FieldValue):
+            db_value = await field.get_value()
+            if db_value is None:
+                continue
+            augmented.value = from_proto.field_text(db_value)
+
+        else:  # pragma: no cover
+            assert_never(prop)
+
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "db_file_field"})
+async def db_augment_file_field(
+    field: File,
+    field_id: FieldId,
+    select: Sequence[FileProp],
+) -> AugmentedFileField:
+    augmented = AugmentedFileField(id=field.field_id)
+
+    for prop in select:
+        if isinstance(prop, FieldText):
+            augmented.text = await get_field_extracted_text(field_id, field)
+
+        elif isinstance(prop, FieldClassificationLabels):
+            augmented.classification_labels = await classification_labels(field_id, field.resource)
+
+        elif isinstance(prop, FieldEntities):
+            augmented.entities = await field_entities(field_id, field)
+
+        # file field props
+
+        elif isinstance(prop, FieldValue):
+            db_value = await field.get_value()
+            if db_value is None:
+                continue
+            augmented.value = from_proto.field_file(db_value)
+
+        elif isinstance(prop, FileThumbnail):
+            augmented.thumbnail_path = await get_file_thumbnail_path(field, field_id)
+
+        else:  # pragma: no cover
+            assert_never(prop)
+
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "db_link_field"})
+async def db_augment_link_field(
+    field: Link,
+    field_id: FieldId,
+    select: Sequence[FieldProp],
+) -> AugmentedLinkField:
+    augmented = AugmentedLinkField(id=field.field_id)
+
+    for prop in select:
+        if isinstance(prop, FieldText):
+            augmented.text = await get_field_extracted_text(field_id, field)
+
+        elif isinstance(prop, FieldClassificationLabels):
+            augmented.classification_labels = await classification_labels(field_id, field.resource)
+
+        elif isinstance(prop, FieldEntities):
+            augmented.entities = await field_entities(field_id, field)
+
+        # link field props
+
+        elif isinstance(prop, FieldValue):
+            db_value = await field.get_value()
+            if db_value is None:
+                continue
+            augmented.value = from_proto.field_link(db_value)
+
+        else:  # pragma: no cover
+            assert_never(prop)
+
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "db_conversation_field"})
+async def db_augment_conversation_field(
+    field: Conversation,
+    field_id: FieldId,
+    select: list[ConversationProp],
+) -> AugmentedConversationField:
+    augmented = AugmentedConversationField(id=field.field_id)
+    # map (page, index) -> augmented message. The key uniquely identifies and
+    # orders messages
+    messages: dict[tuple[int, int], AugmentedConversationMessage] = {}
+
+    for prop in select:
+        if isinstance(prop, FieldText):
+            extracted_text_selected = True
+            if isinstance(prop, ConversationText):
+                selector = prop.selector
+                extracted_text_selected = prop.content_text is False
+            else:
+                # when asking for the conversation text without details, we
+                # choose the message if a split is provided in the id or the
+                # full conversation otherwise
+                if field_id.subfield_id is not None:
+                    selector = MessageSelector()
+                else:
+                    selector = FullSelector()
+
+            # gather the extracted or raw content text from each message matching the selector
+            extracted_text_pb = None
+            if extracted_text_selected:
+                extracted_text_pb = await cache.get_field_extracted_text_pb(field)
+            async for page, index, message in conversation_selector(field, field_id, selector):
+                augmented_message = messages.setdefault(
+                    (page, index),
+                    AugmentedConversationMessage(
+                        ident=message.ident,
+                    ),
+                )
+                if extracted_text_pb is not None and message.ident in extracted_text_pb.split_text:
+                    augmented_message.text = extracted_text_pb.split_text[message.ident]
+                else:
+                    augmented_message.timestamp = message.timestamp.ToDatetime()
+                    augmented_message.content_text = message.content.text
+                    augmented_message.content_format = from_proto.message_content_format(
+                        message.content.format
+                    )
+
+        elif isinstance(prop, FieldValue):
+            db_value = await field.get_metadata()
+            if db_value is None:
+                continue
+            augmented.value = from_proto.field_conversation(db_value)
+
+        elif isinstance(prop, FieldClassificationLabels):
+            augmented.classification_labels = await classification_labels(field_id, field.resource)
+
+        elif isinstance(prop, FieldEntities):
+            augmented.entities = await field_entities(field_id, field)
+
+        elif isinstance(prop, ConversationAttachments):
+            # Each message on a conversation field can have attachments as
+            # references to other fields in the same resource.
+            #
+            # Here, we iterate through all the messages matched by the selector
+            # and collect all the attachment references
+            async for page, index, message in conversation_selector(field, field_id, prop.selector):
+                augmented_message = messages.setdefault(
+                    (page, index),
+                    AugmentedConversationMessage(
+                        ident=message.ident,
+                        timestamp=message.timestamp.ToDatetime(),
+                    ),
+                )
+                augmented_message.attachments = []
+                for ref in message.content.attachments_fields:
+                    field_id = FieldId.from_pb(
+                        field.rid, ref.field_type, ref.field_id, ref.split or None
+                    )
+                    augmented_message.attachments.append(field_id)
+
+        elif isinstance(prop, ConversationAnswerOrAfter):
+            async for page, index, message in conversation_answer_or_after(field, field_id):
+                augmented_message = messages.setdefault(
+                    (page, index),
+                    AugmentedConversationMessage(
+                        ident=message.ident,
+                    ),
+                )
+                if not augmented_message.text:
+                    augmented_message.timestamp = message.timestamp.ToDatetime()
+                    augmented_message.content_text = message.content.text
+                    augmented_message.content_format = from_proto.message_content_format(
+                        message.content.format
+                    )
+
+        else:  # pragma: no cover
+            assert_never(prop)
+
+    if len(messages) > 0:
+        augmented.messages = []
+        for (_page, _index), m in sorted(messages.items()):
+            augmented.messages.append(m)
+
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "db_generic_field"})
+async def db_augment_generic_field(
+    field: Generic,
+    field_id: FieldId,
+    select: Sequence[FieldProp],
+) -> AugmentedGenericField:
+    augmented = AugmentedGenericField(id=field.field_id)
+
+    for prop in select:
+        if isinstance(prop, FieldText):
+            augmented.text = await get_field_extracted_text(field_id, field)
+
+        elif isinstance(prop, FieldClassificationLabels):
+            augmented.classification_labels = await classification_labels(field_id, field.resource)
+
+        elif isinstance(prop, FieldEntities):
+            augmented.entities = await field_entities(field_id, field)
+
+        # generic field props
+
+        elif isinstance(prop, FieldValue):
+            db_value = await field.get_value()
+            augmented.value = db_value
+
+        else:  # pragma: no cover
+            assert_never(prop)
+
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "db_key_value_field"})
+async def db_augment_key_value_field(
+    field: KeyValue,
+) -> AugmentedKeyValueField:
+    augmented = AugmentedKeyValueField(id=field.field_id)
+    db_value = await field.get_value()
+    if db_value is not None:
+        field_key_value = from_proto.field_key_value(db_value)
+        if field_key_value is not None:
+            augmented.value = field_key_value.data
+    return augmented
+
+
+@augmentor_observer.wrap({"type": "field_text"})
+async def get_field_extracted_text(id: FieldId, field: Field) -> str | None:
+    # we store all splits unordered inside nidx_text, so nidx can't support yet
+    # conversation fields
+    if field.type != Conversation.type:
+        nidx_extracted_texts = nidx_et_cache.get()
+        if nidx_extracted_texts is not None:
+            text = await get_field_extracted_text_from_nidx(field.kbid, id)
+        else:
+            # nidx texts not available, either we are not calling from augmentor
+            # or something went wrong. In any case, fallback to object storage
+            text = await get_field_extracted_text_from_storage(id, field)
+
+    else:
+        text = await get_field_extracted_text_from_storage(id, field)
+
+    return text
+
+
+async def get_field_extracted_text_from_nidx(kbid: str, id: FieldId) -> str | None:
+    nidx_extracted_texts = nidx_et_cache.get()
+    assert nidx_extracted_texts is not None, "this function must be called with the nidx texts cache set"
+    return nidx_extracted_texts.get_field_text(id)
+
+
+@augmentor_observer.wrap({"type": "field_text:storage"})
+async def get_field_extracted_text_from_storage(id: FieldId, field: Field) -> str | None:
+    extracted_text_pb = await cache.get_field_extracted_text_pb(field)
+    if extracted_text_pb is None:  # pragma: no cover
+        return None
+
+    if id.subfield_id:
+        return extracted_text_pb.split_text[id.subfield_id]
+    else:
+        return extracted_text_pb.text
+
+
+async def classification_labels(id: FieldId, resource: Resource) -> dict[str, set[str]] | None:
+    basic = await get_basic(resource)
+    if basic is None:
+        return None
+
+    labels: dict[str, set[str]] = {}
+    for fc in basic.computedmetadata.field_classifications:
+        if fc.field.field == id.key and fc.field.field_type == id.pb_type:
+            for classification in fc.classifications:
+                if classification.cancelled_by_user:  # pragma: no cover
+                    continue
+                labels.setdefault(classification.labelset, set()).add(classification.label)
+    return labels
+
+
+async def field_entities(id: FieldId, field: Field) -> dict[str, set[str]] | None:
+    field_metadata = await field.get_field_metadata()
+    if field_metadata is None:
+        return None
+
+    ners: dict[str, set[str]] = {}
+    # Data Augmentation + Processor entities
+    for (
+        data_aumgentation_task_id,
+        entities_wrapper,
+    ) in field_metadata.metadata.entities.items():
+        for entity in entities_wrapper.entities:
+            ners.setdefault(entity.label, set()).add(entity.text)
+    # Legacy processor entities
+    # TODO(decoupled-ask): Remove once processor doesn't use this anymore and remove the positions and ner fields from the message
+    for token, family in field_metadata.metadata.ner.items():
+        ners.setdefault(family, set()).add(token)
+
+    return ners
+
+
+async def get_file_thumbnail_path(field: File, field_id: FieldId) -> str | None:
+    thumbnail = await field.thumbnail()
+    if thumbnail is None:
+        return None
+
+    # When ingesting file processed data, we move thumbnails to a owned
+    # path. The thumbnail.key must then match this path so we can safely
+    # return a path that can be used with the download API to get the
+    # actual image
+    _expected_prefix = STORAGE_FILE_EXTRACTED.format(
+        kbid=field.kbid, uuid=field.rid, field_type=field_id.type, field=field_id.key, key=""
+    )
+    assert thumbnail.key.startswith(_expected_prefix), (
+        "we use a hardcoded path for file thumbnails and we assume is this"
+    )
+    thumbnail_path = thumbnail.key.removeprefix(_expected_prefix)
+
+    return thumbnail_path
+
+
+async def find_conversation_message(
+    field: Conversation, ident: str
+) -> tuple[int, int, resources_pb2.Message] | None:
+    """Find a message in the conversation identified by `ident`."""
+    splits_metadata = await field.get_splits_metadata()
+    deleted_splits = set(splits_metadata.deleted_splits)
+    if ident in deleted_splits:
+        # The message has been deleted, we consider it not found.
+        return None
+    split_meta = splits_metadata.metadata.get(ident)
+    if split_meta is not None:
+        # Go directly to the page specified in the split metadata.
+        conversation = await field.db_get_value(split_meta.page)
+        for idx, message in enumerate(conversation.messages):
+            if message.ident == ident:
+                return split_meta.page, idx, message
+    return None
+
+
+async def find_conversation_messages(
+    field: Conversation, idents: list[str]
+) -> AsyncIterator[tuple[int, int, resources_pb2.Message]]:
+    """
+    Find multiple messages in the conversation identified by `idents`. Yields tuples of (page, index, message) for each found message.
+    """
+    splits_metadata = await field.get_splits_metadata()
+    deleted_splits = set(splits_metadata.deleted_splits)
+    # Group messages by page
+    messages_by_page: dict[int, list[str]] = {}
+    for ident in idents:
+        if ident in deleted_splits:
+            # The message has been deleted, we consider it not found.
+            continue
+        split_meta = splits_metadata.metadata.get(ident)
+        if split_meta is not None:
+            messages_by_page.setdefault(split_meta.page, []).append(ident)
+    # Now, for each page, get the conversation page and yield the messages.
+    for page, idents in messages_by_page.items():
+        conversation = await field.db_get_value(page)
+        for idx, message in enumerate(conversation.messages):
+            if message.ident in idents:
+                yield page, idx, message
+
+
+async def iter_conversation_messages(
+    field: Conversation,
+    *,
+    start_from: tuple[int, int] = (1, 0),  # (page, message)
+) -> AsyncIterator[tuple[int, int, resources_pb2.Message]]:
+    """Iterate through the conversation messages starting from an specific page
+    and index.
+
+    """
+    start_page, start_index = start_from
+    conversation_metadata = await field.get_metadata()
+    if conversation_metadata is None:
+        return
+    splits_metadata = await field.get_splits_metadata()
+    deleted_splits = set(splits_metadata.deleted_splits)
+    for page in range(start_page, conversation_metadata.pages + 1):
+        conversation = await field.db_get_value(page)
+        for idx, message in enumerate(conversation.messages[start_index:]):
+            if message.ident in deleted_splits:
+                # Message has been deleted, skip it
+                continue
+            yield (page, start_index + idx, message)
+        # next iteration we want all messages
+        start_index = 0
+
+
+async def conversation_answer(
+    field: Conversation,
+    *,
+    start_from: tuple[int, int] = (1, 0),  # (page, message)
+) -> tuple[int, int, resources_pb2.Message] | None:
+    """Find the next conversation message of type ANSWER starting from an
+    specific page and index.
+
+    """
+    async for page, index, message in iter_conversation_messages(field, start_from=start_from):
+        if message.type == resources_pb2.Message.MessageType.ANSWER:
+            return page, index, message
+    return None
+
+
+async def conversation_messages_after(
+    field: Conversation,
+    *,
+    start_from: tuple[int, int] = (1, 0),  # (page, index)
+    limit: int | None = None,
+) -> AsyncIterator[tuple[int, int, resources_pb2.Message]]:
+    assert limit is None or limit > 0, "this function can't iterate backwards"
+    async for page, index, message in iter_conversation_messages(field, start_from=start_from):
+        yield page, index, message
+
+        if limit is not None:
+            limit -= 1
+            if limit == 0:
+                break
+
+
+async def conversation_selector(
+    field: Conversation,
+    field_id: FieldId,
+    selector: ConversationSelector,
+) -> AsyncIterator[tuple[int, int, resources_pb2.Message]]:
+    """Given a conversation, iterate through the messages matched by a
+    selector.
+
+    """
+    split = field_id.subfield_id
+
+    if isinstance(selector, MessageSelector):
+        if selector.id is None and selector.index is None and split is None:
+            return
+
+        if selector.index is not None:
+            metadata = await field.get_metadata()
+            if metadata is None:
+                # we can't know about pages/messages
+                return
+
+            if isinstance(selector.index, int):
+                page = selector.index // metadata.size + 1
+                index = selector.index % metadata.size
+
+            elif isinstance(selector.index, str):
+                if selector.index == "first":
+                    page, index = (1, 0)
+                elif selector.index == "last":
+                    page = metadata.pages
+                    index = metadata.total % metadata.size - 1
+                else:  # pragma: no cover
+                    assert_never(selector.index)
+
+            else:  # pragma: no cover
+                assert_never(selector.index)
+
+            found = None
+            async for found in iter_conversation_messages(field, start_from=(page, index)):
+                break
+
+            if found is None:
+                return
+
+            page, index, message = found
+            yield page, index, message
+
+        else:
+            # selector.id takes priority over the field id, as it is more specific
+            if selector.id is not None:
+                split = selector.id
+            assert split is not None
+
+            found = await find_conversation_message(field, split)
+            if found is None:
+                return
+
+            page, index, message = found
+            yield page, index, message
+
+    elif isinstance(selector, MessagesSelector):
+        async for page, index, message in find_conversation_messages(field, selector.ids):
+            yield page, index, message
+
+    elif isinstance(selector, PageSelector):
+        if split is None:
+            return
+        found = await find_conversation_message(field, split)
+        if found is None:
+            return
+        page, _, _ = found
+
+        conversation_page = await field.db_get_value(page)
+        for index, message in enumerate(conversation_page.messages):
+            yield page, index, message
+
+    elif isinstance(selector, NeighboursSelector):
+        selector = cast(NeighboursSelector, selector)
+        if split is None:
+            return
+        found = await find_conversation_message(field, split)
+        if found is None:
+            return
+        page, index, message = found
+        yield page, index, message
+
+        start_from = (page, index + 1)
+        async for page, index, message in conversation_messages_after(
+            field, start_from=start_from, limit=selector.after
+        ):
+            yield page, index, message
+
+    elif isinstance(selector, WindowSelector):
+        if split is None:
+            return
+        # Find the position of the `split` message and get the window
+        # surrounding it. If there are not enough preceding/following messages,
+        # the window won't be centered
+        messages: Deque[tuple[int, int, resources_pb2.Message]] = deque(maxlen=selector.size)
+        metadata = await field.get_metadata()
+        if metadata is None:
+            return
+        pending = -1
+        for page in range(1, metadata.pages + 1):
+            conversation_page = await field.db_get_value(page)
+            for index, message in enumerate(conversation_page.messages):
+                messages.append((page, index, message))
+                if pending > 0:
+                    pending -= 1
+                if message.ident == split:
+                    pending = (selector.size - 1) // 2
+                if pending == 0:
+                    break
+            if pending == 0:
+                break
+
+        for page, index, message in messages:
+            yield page, index, message
+
+    elif isinstance(selector, AnswerSelector):
+        if split is None:
+            return
+        found = await find_conversation_message(field, split)
+        if found is None:
+            return
+        page, index, message = found
+
+        found = await conversation_answer(field, start_from=(page, index))
+        if found is not None:
+            page, index, answer = found
+            yield page, index, answer
+
+    elif isinstance(selector, FullSelector):
+        async for page, index, message in iter_conversation_messages(field):
+            yield page, index, message
+
+    else:  # pragma: no cover
+        assert_never(selector)
+
+
+async def conversation_answer_or_after(
+    field: Conversation, field_id: FieldId
+) -> AsyncIterator[tuple[int, int, resources_pb2.Message]]:
+    m: resources_pb2.Message | None = None
+    # first search the message in the conversation
+    async for page, index, m in conversation_selector(field, field_id, MessageSelector()):
+        pass
+
+    if m is None:
+        return
+
+    if m.type == resources_pb2.Message.MessageType.QUESTION:
+        # try to find an answer for this question
+        found = await conversation_answer(field, start_from=(page, index + 1))
+        if found is None:
+            return
+        else:
+            page, index, answer = found
+            yield page, index, answer
+
+    else:
+        # add a bunch of messages after this for more context
+        async for page, index, message in conversation_messages_after(
+            field, start_from=(page, index + 1), limit=CONVERSATION_MESSAGE_CONTEXT_EXPANSION
+        ):
+            yield page, index, message

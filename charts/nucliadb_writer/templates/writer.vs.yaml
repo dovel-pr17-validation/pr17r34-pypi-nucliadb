@@ -1,0 +1,127 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: writer
+spec:
+  gateways:
+    - "{{ .Values.vs.gateway }}"
+  hosts:
+    - "{{ .Values.zone }}.{{ .Values.vs.host }}"
+  http:
+    - name: nucliadb_writer
+      match:
+        # KB config
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/configuration'
+          method:
+            regex: "POST|PATCH|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/extract_strategies.*'
+          method:
+            regex: "POST|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/split_strategies.*'
+          method:
+            regex: "POST|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/processing_webhooks.*'
+          method:
+            regex: "PUT|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/vectorsets/[^/]+$'
+          method:
+            regex: "POST|DELETE|OPTIONS"
+
+        # resources
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/resources'
+          method:
+            regex: "POST|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+$'
+          method:
+            regex: "PATCH|DELETE|OPTIONS"
+
+        # fields
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/(text|file|link|conversation|key_value)/[^/]+$'
+          method:
+            regex: "PUT|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/(text|file|link|conversation)/[^/]+$'
+          method:
+            regex: "PATCH|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/conversation/[^/]+/messages'
+          method:
+            regex: "PUT|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/conversation/[^/]+/messages/[^/]+$'
+          method:
+            regex: "DELETE|OPTIONS"
+
+        # upload
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/upload'
+          method:
+            regex: "POST|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/file/[^/]+/upload'
+          method:
+            regex: "POST|OPTIONS"
+
+        # reprocess/reindex
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/(reprocess|reindex)'
+          method:
+            regex: "POST|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/(file|text|conversation|link)/[^/]+/reprocess'
+          method:
+            regex: "POST|OPTIONS"
+
+        # misc
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/labelset/[^/]+$'
+          method:
+            regex: "POST|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/custom-synonyms'
+          method:
+            regex: "PUT|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(export|import)'
+          method:
+            regex: "POST|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/search_configurations/[^/]+$'
+          method:
+            regex: "POST|PATCH|DELETE|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/kv-schemas.*'
+          method:
+            regex: "POST|PUT|DELETE|OPTIONS"
+
+      route:
+        - destination:
+            port:
+              number: {{.Values.serving.port}}
+            host: "writer.{{ .Release.Namespace }}.svc.cluster.local"
+    - name: nucliadb_writer_tus
+      match:
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/(resource|slug)/[^/]+/file/[^/]+/tusupload.*'
+          method:
+            regex: "POST|PATCH|HEAD|OPTIONS"
+        - uri:
+            regex: '^/api/v\d+/kb/[^/]+/tusupload.*'
+          method:
+            regex: "POST|PATCH|HEAD|OPTIONS"
+      retries:
+        attempts: 3
+        retryOn: connect-failure
+      route:
+        - destination:
+            port:
+              number: {{.Values.serving.port}}
+            host: "writer.{{ .Release.Namespace }}.svc.cluster.local"

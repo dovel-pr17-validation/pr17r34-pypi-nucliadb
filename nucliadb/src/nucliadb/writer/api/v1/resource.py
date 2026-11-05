@@ -1,0 +1,774 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import contextlib
+from time import time
+from typing import Annotated
+from uuid import UUID, uuid4
+
+from fastapi import BackgroundTasks, HTTPException, Query, Response
+from fastapi_versioning import version
+from nidx_protos.nodereader_pb2 import StreamRequest
+from starlette.requests import Request
+
+from nucliadb.common import datamanagers
+from nucliadb.common.back_pressure import maybe_back_pressure
+from nucliadb.common.context.fastapi import get_app_context
+from nucliadb.common.filter_expression import parse_expression
+from nucliadb.common.maindb.driver import Driver
+from nucliadb.common.maindb.exceptions import ConflictError, NotFoundError
+from nucliadb.common.maindb.utils import get_driver
+from nucliadb.common.nidx import get_nidx_searcher_client
+from nucliadb.ingest.orm.knowledgebox import KnowledgeBox
+from nucliadb.models.internal.processing import ProcessingInfo, PushPayload, Source
+from nucliadb.tasks.deleter import schedule_batch_delete
+from nucliadb.writer import SERVICE_NAME, logger, transaction
+from nucliadb.writer.api.constants import X_NUCLIADB_USER, X_REPROCESS_BATCH_SIZE, X_SKIP_STORE
+from nucliadb.writer.api.v1.router import (
+    KB_PREFIX,
+    RESOURCE_PREFIX,
+    RESOURCES_PREFIX,
+    RSLUG_PREFIX,
+    api,
+)
+from nucliadb.writer.api.v1.slug import ensure_slug_uniqueness, noop_context_manager
+from nucliadb.writer.resource.audit import parse_audit
+from nucliadb.writer.resource.basic import (
+    parse_basic_creation,
+    parse_basic_modify,
+    parse_user_classifications,
+    set_processing_metadata_from_basic,
+    set_status,
+    set_status_modify,
+)
+from nucliadb.writer.resource.field import (
+    REPROCESSABLE_FIELD_TYPES,
+    ResourceClassifications,
+    atomic_get_stored_resource_classifications,
+    collect_fields_for_reprocessing,
+    is_generated_conversation_field,
+    parse_fields,
+)
+from nucliadb.writer.resource.origin import parse_extra, parse_origin
+from nucliadb.writer.utilities import get_processing
+from nucliadb_models.resource import BatchDeleteRequest, BatchDeleteResponse, NucliaDBRoles
+from nucliadb_models.writer import (
+    CreateResourcePayload,
+    ResourceCreated,
+    ResourceUpdated,
+    UpdateResourcePayload,
+)
+from nucliadb_protos.resources_pb2 import FieldID, Metadata
+from nucliadb_protos.writer_pb2 import (
+    Audit,
+    BrokerMessage,
+    FieldIDStatus,
+    FieldStatus,
+    IndexResource,
+)
+from nucliadb_telemetry.errors import capture_exception
+from nucliadb_utils.authentication import requires
+from nucliadb_utils.exceptions import LimitsExceededError, SendToProcessError
+from nucliadb_utils.utilities import (
+    get_ingest,
+    get_partitioning,
+    get_storage,
+)
+
+
+@api.post(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCES_PREFIX}",
+    status_code=201,
+    name="Create Resource",
+    description="Create a new Resource in a Knowledge Box",
+    response_model=ResourceCreated,
+    response_model_exclude_unset=True,
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def create_resource(
+    request: Request,
+    item: CreateResourcePayload,
+    kbid: str,
+    x_skip_store: Annotated[bool, X_SKIP_STORE] = False,
+    x_nucliadb_user: Annotated[str, X_NUCLIADB_USER] = "",
+):
+    kb_config = await datamanagers.atomic.kb.get_config(kbid=kbid)
+    if item.hidden and not (kb_config and kb_config.hidden_resources_enabled):
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot hide a resource: the KB does not have hidden resources enabled",
+        )
+    await maybe_back_pressure(kbid)
+
+    partitioning = get_partitioning()
+
+    # Create resource message
+    # resource ids are always UUIDs in hex format (32 chars, no hyphens)
+    uuid = uuid4().hex
+    partition = partitioning.generate_partition(kbid, uuid)
+
+    writer = BrokerMessage()
+    toprocess = PushPayload(
+        uuid=uuid,
+        kbid=kbid,
+        partition=partition,
+        userid=x_nucliadb_user,
+        processing_options=item.processing_options,
+    )
+
+    writer.kbid = kbid
+    toprocess.kbid = kbid
+    writer.uuid = uuid
+    toprocess.uuid = uuid
+    toprocess.source = Source.HTTP
+    toprocess.title = item.title
+
+    unique_slug_context_manager = noop_context_manager()
+    if item.slug:
+        unique_slug_context_manager = ensure_slug_uniqueness(kbid, item.slug)
+        writer.slug = item.slug
+        toprocess.slug = item.slug
+
+    async with unique_slug_context_manager:
+        parse_audit(writer.audit, request)
+        parse_basic_creation(writer, item, toprocess, kb_config)
+
+        if item.origin is not None:
+            parse_origin(writer.origin, item.origin)
+        if item.extra is not None:
+            parse_extra(writer.extra, item.extra)
+
+        # Since this is a resource creation, we need to care only about the user-provided
+        # classifications in the request.
+        resource_classifications = ResourceClassifications(
+            resource_level=set(parse_user_classifications(item))
+        )
+        await parse_fields(
+            writer=writer,
+            item=item,
+            toprocess=toprocess,
+            kbid=kbid,
+            uuid=uuid,
+            x_skip_store=x_skip_store,
+            resource_classifications=resource_classifications,
+        )
+        set_status(writer.basic, item)
+
+        writer.source = BrokerMessage.MessageSource.WRITER
+
+        if item.wait_for_commit:
+            t0 = time()
+        await transaction.commit(writer, partition, wait=item.wait_for_commit)
+
+        if item.wait_for_commit:
+            txn_time = time() - t0
+        else:
+            txn_time = None
+
+        seqid = await maybe_send_to_process(toprocess, partition)
+
+        return ResourceCreated(seqid=seqid, uuid=uuid, elapsed=txn_time)
+
+
+@api.patch(
+    f"/{KB_PREFIX}/{{kbid}}/{RSLUG_PREFIX}/{{rslug}}",
+    status_code=200,
+    summary="Modify Resource (by slug)",
+    response_model=ResourceUpdated,
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def modify_resource_rslug_prefix(
+    request: Request,
+    kbid: str,
+    rslug: str,
+    item: UpdateResourcePayload,
+    x_skip_store: Annotated[bool, X_SKIP_STORE] = False,
+    x_nucliadb_user: Annotated[str, X_NUCLIADB_USER] = "",
+):
+    rid = await get_rid_from_slug_or_raise_error(kbid, rslug)
+    return await modify_resource_endpoint(
+        request,
+        item,
+        kbid,
+        rid,
+        x_skip_store=x_skip_store,
+        x_nucliadb_user=x_nucliadb_user,
+    )
+
+
+@api.patch(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCE_PREFIX}/{{rid}}",
+    status_code=200,
+    summary="Modify Resource (by id)",
+    response_model=ResourceUpdated,
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def modify_resource_rid_prefix(
+    request: Request,
+    kbid: str,
+    rid: str,
+    item: UpdateResourcePayload,
+    x_nucliadb_user: Annotated[str, X_NUCLIADB_USER] = "",
+    x_skip_store: Annotated[bool, X_SKIP_STORE] = False,
+):
+    return await modify_resource_endpoint(
+        request,
+        item,
+        kbid,
+        rid,
+        x_skip_store=x_skip_store,
+        x_nucliadb_user=x_nucliadb_user,
+    )
+
+
+async def modify_resource_endpoint(
+    request: Request,
+    item: UpdateResourcePayload,
+    kbid: str,
+    rid: str,
+    x_skip_store: bool,
+    x_nucliadb_user: str,
+):
+    await validate_rid_exists_or_raise_error(kbid, rid)
+
+    await maybe_back_pressure(kbid, resource_uuid=rid)
+
+    if item.slug is None:
+        return await modify_resource(
+            request,
+            item,
+            kbid,
+            x_skip_store=x_skip_store,
+            x_nucliadb_user=x_nucliadb_user,
+            rid=rid,
+        )
+
+    async with safe_update_resource_slug(request, kbid, rid=rid, new_slug=item.slug):
+        return await modify_resource(
+            request,
+            item,
+            kbid,
+            x_skip_store=x_skip_store,
+            x_nucliadb_user=x_nucliadb_user,
+            rid=rid,
+        )
+
+
+async def modify_resource(
+    request: Request,
+    item: UpdateResourcePayload,
+    kbid: str,
+    x_skip_store: bool,
+    x_nucliadb_user: str,
+    *,
+    rid: str,
+):
+    kb_config = await datamanagers.atomic.kb.get_config(kbid=kbid)
+    if item.hidden and not (kb_config and kb_config.hidden_resources_enabled):
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot hide a resource: the KB does not have hidden resources enabled",
+        )
+
+    partitioning = get_partitioning()
+
+    partition = partitioning.generate_partition(kbid, rid)
+
+    writer = BrokerMessage()
+    toprocess = PushPayload(
+        uuid=rid,
+        kbid=kbid,
+        partition=partition,
+        userid=x_nucliadb_user,
+        processing_options=item.processing_options,
+    )
+
+    writer.kbid = kbid
+    writer.uuid = rid
+    toprocess.kbid = kbid
+    toprocess.uuid = rid
+    toprocess.source = Source.HTTP
+
+    if item.title is None or item.slug is None:
+        await set_processing_metadata_from_basic(toprocess, kbid, rid)
+
+    parse_basic_modify(writer, item, toprocess)
+    if item.title is not None:
+        toprocess.title = writer.basic.title
+    if item.slug is not None:
+        toprocess.slug = item.slug
+
+    parse_audit(writer.audit, request)
+    if item.origin is not None:
+        parse_origin(writer.origin, item.origin)
+    if item.extra is not None:
+        parse_extra(writer.extra, item.extra)
+
+    if item.usermetadata is not None:
+        # If usermetadata is set in the request payload, this means that stored resource classifications
+        # are not valid and we need to use the ones provided by the user in the request
+        resource_classifications = ResourceClassifications(
+            resource_level=set(parse_user_classifications(item))
+        )
+    else:
+        resource_classifications = await atomic_get_stored_resource_classifications(kbid, rid)
+
+    await parse_fields(
+        writer=writer,
+        item=item,
+        toprocess=toprocess,
+        kbid=kbid,
+        uuid=rid,
+        x_skip_store=x_skip_store,
+        resource_classifications=resource_classifications,
+    )
+    set_status_modify(writer.basic, item)
+
+    writer.source = BrokerMessage.MessageSource.WRITER
+
+    maybe_mark_reindex(writer, item)
+
+    await transaction.commit(writer, partition)
+    seqid = await maybe_send_to_process(toprocess, partition)
+
+    return ResourceUpdated(seqid=seqid)
+
+
+@contextlib.asynccontextmanager
+async def safe_update_resource_slug(
+    request,
+    kbid: str,
+    *,
+    rid: str,
+    new_slug: str,
+):
+    driver = get_app_context(request.app).kv_driver
+    try:
+        old_slug = await update_resource_slug(driver, kbid, rid=rid, new_slug=new_slug)
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Resource does not exist: {rid}")
+    except ConflictError:
+        raise HTTPException(status_code=409, detail=f"Slug already exists: {new_slug}")
+    try:
+        yield
+    except Exception:
+        # Rollback slug update if something goes wrong
+        try:
+            await update_resource_slug(driver, kbid, rid=rid, new_slug=old_slug)
+        except Exception as ex:
+            capture_exception(ex)
+            logger.exception("Error while rolling back slug update")
+        raise
+
+
+async def update_resource_slug(
+    driver: Driver,
+    kbid: str,
+    *,
+    rid: str,
+    new_slug: str,
+):
+    async with driver.rw_transaction() as txn:
+        old_slug = await datamanagers.resources.update_slug(txn, kbid=kbid, rid=rid, new_slug=new_slug)
+        await txn.commit()
+        return old_slug
+
+
+@api.post(
+    f"/{KB_PREFIX}/{{kbid}}/{RSLUG_PREFIX}/{{rslug}}/reprocess",
+    status_code=202,
+    summary="Reprocess resource (by slug)",
+    response_model=ResourceUpdated,
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def reprocess_resource_rslug_prefix(
+    request: Request,
+    kbid: str,
+    rslug: str,
+    x_nucliadb_user: Annotated[str, X_NUCLIADB_USER] = "",
+    reset_title: bool = Query(
+        default=False,
+        description="Reset the title of the resource so that the file or link computed titles are set after processing.",
+    ),
+    x_reprocess_batch_size: Annotated[int, X_REPROCESS_BATCH_SIZE] = 20,
+):
+    rid = await get_rid_from_slug_or_raise_error(kbid, rslug)
+    return await _reprocess_resource(
+        request,
+        kbid,
+        rid,
+        x_nucliadb_user=x_nucliadb_user,
+        reset_title=reset_title,
+        field_batch_size=x_reprocess_batch_size,
+    )
+
+
+@api.post(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCE_PREFIX}/{{rid}}/reprocess",
+    status_code=202,
+    summary="Reprocess resource (by id)",
+    response_model=ResourceUpdated,
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def reprocess_resource_rid_prefix(
+    request: Request,
+    kbid: str,
+    rid: str,
+    x_nucliadb_user: Annotated[str, X_NUCLIADB_USER] = "",
+    reset_title: bool = Query(
+        default=False,
+        description="Reset the title of the resource so that the file or link computed titles are set after processing.",
+    ),
+    x_reprocess_batch_size: Annotated[int, X_REPROCESS_BATCH_SIZE] = 20,
+):
+    return await _reprocess_resource(
+        request,
+        kbid,
+        rid,
+        x_nucliadb_user=x_nucliadb_user,
+        reset_title=reset_title,
+        field_batch_size=x_reprocess_batch_size,
+    )
+
+
+async def _reprocess_resource(
+    request: Request,
+    kbid: str,
+    rid: str,
+    x_nucliadb_user: str,
+    reset_title: bool = Query(
+        default=False,
+        description="Reset the title of the resource so that the file or link computed titles are set after processing.",
+    ),
+    field_batch_size: int = 20,
+):
+    await validate_rid_exists_or_raise_error(kbid, rid)
+    await maybe_back_pressure(kbid, resource_uuid=rid)
+
+    partitioning = get_partitioning()
+    partition = partitioning.generate_partition(kbid, rid)
+
+    storage = await get_storage(service_name=SERVICE_NAME)
+    driver = get_driver()
+
+    writer = BrokerMessage(
+        kbid=kbid,
+        uuid=rid,
+        source=BrokerMessage.MessageSource.WRITER,
+    )
+    writer.basic.reset_title = reset_title
+    writer.basic.metadata.useful = True
+    writer.basic.metadata.status = Metadata.Status.PENDING
+
+    # First pass: collect all reprocessable field ids and prepare writer message
+    all_reprocessable_fields: list[tuple[int, str]] = []
+    async with driver.ro_transaction() as txn:
+        kb = KnowledgeBox(txn, storage, kbid)
+        resource = await kb.get(rid)
+        if resource is None:
+            raise HTTPException(status_code=404, detail="Resource does not exist")
+        basic = resource.basic
+
+        resource_fields = await resource.get_fields()
+        for field_type, field_id in resource_fields.keys():
+            if field_type not in REPROCESSABLE_FIELD_TYPES:
+                continue
+
+            if is_generated_conversation_field(field_type, field_id):
+                # On reprocessing the full resource, we don't want to send the generated conversation
+                # fields, as they will be regenerated from the source conversation field. So we skip them.
+                continue
+
+            all_reprocessable_fields.append((field_type, field_id))
+            writer.field_statuses.append(
+                FieldIDStatus(
+                    id=FieldID(field_type=field_type, field=field_id),
+                    status=FieldStatus.Status.PENDING,
+                )
+            )
+
+    # Second pass: batch and send processing requests
+    # Process fields in batches to reduce memory usage and improve resilience
+    processing_info = None
+
+    for i in range(0, len(all_reprocessable_fields), field_batch_size):
+        batch_fields = set(all_reprocessable_fields[i : i + field_batch_size])
+        toprocess = PushPayload(
+            uuid=rid,
+            kbid=kbid,
+            partition=partition,
+            userid=x_nucliadb_user,
+            source=Source.HTTP,
+        )
+        if basic is not None:
+            toprocess.title = basic.title
+            toprocess.slug = basic.slug
+        async with driver.ro_transaction() as txn:
+            resource.txn = txn
+            await collect_fields_for_reprocessing(
+                resource=resource,
+                toprocess=toprocess,
+                selected_fields=batch_fields,
+            )
+        processing_info = await send_to_process(toprocess, partition)
+
+    # Commit writer message only if there were fields to process
+    if all_reprocessable_fields:
+        await transaction.commit(writer, partition, wait=False)
+
+    return ResourceUpdated(seqid=processing_info.seqid if processing_info else None)
+
+
+@api.delete(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCES_PREFIX}",
+    status_code=200,
+    summary="Delete multiple resources asynchronously based on a filtered query",
+    tags=["Resources"],
+    response_model=BatchDeleteResponse,
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def delete_resource_batch(request: Request, item: BatchDeleteRequest, kbid: str):
+    filter_pb = await parse_expression(item.filter_expression.resource, kbid)
+
+    async with datamanagers.with_ro_transaction() as txn:
+        shards = await datamanagers.kb.get_shards(txn, kbid=kbid)
+        if shards is None:
+            raise HTTPException(
+                status_code=404,
+                detail="The knowledgebox or its shards configuration is missing",
+            )
+
+    stream_request = StreamRequest()
+    stream_request.filter_expression.CopyFrom(filter_pb)
+
+    deletes = set()
+    for shard_obj in shards.shards:
+        if shard_obj.nidx_shard_id is not None:
+            stream_request.shard_id.id = shard_obj.nidx_shard_id
+            async for doc in get_nidx_searcher_client().Documents(stream_request):
+                # make sure resource ids are 32-char UUIDs (without "-"s)
+                rid = UUID(doc.uuid).hex
+                deletes.add(rid)
+
+    if not deletes:
+        # nothing matched the filter
+        return BatchDeleteResponse(
+            delete_id=uuid4(),
+            resources=[],
+        )
+
+    # schedule a delete job with the delete set. We ignore out-of-sync index
+    # issues and return the set of resources got from nidx to the user.
+    audit = Audit()
+    parse_audit(audit, request)
+    deletion_id = await schedule_batch_delete(request.app.state.context, kbid, deletes, audit)
+
+    return BatchDeleteResponse(
+        delete_id=deletion_id,
+        resources=list(deletes),
+    )
+
+
+@api.delete(
+    f"/{KB_PREFIX}/{{kbid}}/{RSLUG_PREFIX}/{{rslug}}",
+    status_code=204,
+    summary="Delete Resource (by slug)",
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def delete_resource_rslug_prefix(
+    request: Request, kbid: str, rslug: str, background: BackgroundTasks
+):
+    rid = await get_rid_from_slug_or_raise_error(kbid, rslug)
+    return await _delete_resource(request, kbid, rid, background)
+
+
+@api.delete(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCE_PREFIX}/{{rid}}",
+    status_code=204,
+    summary="Delete Resource (by id)",
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def delete_resource_rid_prefix(request: Request, kbid: str, rid: str, background: BackgroundTasks):
+    return await _delete_resource(request, kbid, rid, background)
+
+
+async def _delete_resource(request: Request, kbid: str, rid: str, background: BackgroundTasks):
+    await validate_rid_exists_or_raise_error(kbid, rid)
+
+    partitioning = get_partitioning()
+
+    partition = partitioning.generate_partition(kbid, rid)
+    writer = BrokerMessage()
+
+    writer.kbid = kbid
+    writer.uuid = rid
+    writer.type = BrokerMessage.MessageType.DELETE
+
+    parse_audit(writer.audit, request)
+    await transaction.commit(writer, partition)
+    processing = get_processing()
+    background.add_task(processing.delete_from_processing, kbid=kbid, resource_id=rid)
+
+    return Response(status_code=204)
+
+
+@api.post(
+    f"/{KB_PREFIX}/{{kbid}}/{RSLUG_PREFIX}/{{rslug}}/reindex",
+    status_code=204,
+    summary="Reindex Resource (by slug)",
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def reindex_resource_rslug_prefix(
+    request: Request,
+    kbid: str,
+    rslug: str,
+    reindex_vectors: bool = Query(False),
+):
+    rid = await get_rid_from_slug_or_raise_error(kbid, rslug)
+    return await _reindex_resource(request, kbid, rid, reindex_vectors=reindex_vectors)
+
+
+@api.post(
+    f"/{KB_PREFIX}/{{kbid}}/{RESOURCE_PREFIX}/{{rid}}/reindex",
+    status_code=204,
+    summary="Reindex Resource (by id)",
+    tags=["Resources"],
+)
+@requires(NucliaDBRoles.WRITER)
+@version(1)
+async def reindex_resource_rid_prefix(
+    request: Request,
+    kbid: str,
+    rid: str,
+    reindex_vectors: bool = Query(False),
+):
+    return await _reindex_resource(request, kbid, rid, reindex_vectors=reindex_vectors)
+
+
+async def _reindex_resource(
+    request: Request,
+    kbid: str,
+    rid: str,
+    reindex_vectors: bool,
+):
+    await validate_rid_exists_or_raise_error(kbid, rid)
+    await maybe_back_pressure(kbid, resource_uuid=rid)
+
+    ingest = get_ingest()
+    index_req = IndexResource()
+    index_req.kbid = kbid
+    index_req.rid = rid
+    index_req.reindex_vectors = reindex_vectors
+
+    await ingest.ReIndex(index_req)  # type: ignore
+    return Response(status_code=200)
+
+
+async def get_rid_from_slug_or_raise_error(kbid: str, rslug: str) -> str:
+    rid = await datamanagers.atomic.resources.get_rid(kbid=kbid, slug=rslug)
+    if not rid:
+        raise HTTPException(status_code=404, detail="Resource does not exist")
+    return rid
+
+
+async def validate_rid_exists_or_raise_error(kbid: str, rid: str):
+    if not (await datamanagers.atomic.resources.exists(kbid=kbid, rid=rid)):
+        raise HTTPException(status_code=404, detail="Resource does not exist")
+
+
+def maybe_mark_reindex(message: BrokerMessage, item: UpdateResourcePayload):
+    if needs_resource_reindex(item):
+        message.reindex = True
+
+
+def needs_resource_reindex(item: UpdateResourcePayload) -> bool:
+    # Some metadata need to be applied as tags to all fields of
+    # a resource and that means this message should force reindexing everything.
+    # XXX This is not ideal. Long term, we should handle it differently
+    # so this is not required
+    return (
+        item.usermetadata is not None
+        or item.hidden is not None
+        or (
+            item.origin is not None
+            and (
+                item.origin.created is not None
+                or item.origin.modified is not None
+                or item.origin.metadata is not None
+            )
+        )
+        or item.security is not None
+    )
+
+
+async def maybe_send_to_process(toprocess: PushPayload, partition) -> int | None:
+    if not needs_reprocess(toprocess):
+        return None
+
+    processing_info = await send_to_process(toprocess, partition)
+    return processing_info.seqid
+
+
+async def send_to_process(toprocess: PushPayload, partition) -> ProcessingInfo:
+    try:
+        processing = get_processing()
+        processing_info = await processing.send_to_process(toprocess, partition)
+        return processing_info
+    except LimitsExceededError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except SendToProcessError:
+        raise HTTPException(
+            status_code=500,
+            detail="Error while sending to process. Try calling /reprocess",
+        )
+
+
+def needs_reprocess(processing_payload: PushPayload) -> bool:
+    """
+    Processing only pays attention to when there are fields to process,
+    so sometimes we can skip sending to processing, for instance if a
+    resource/paragraph is being annotated.
+    """
+    for field in (
+        "genericfield",
+        "filefield",
+        "linkfield",
+        "textfield",
+        "conversationfield",
+    ):
+        if len(getattr(processing_payload, field)) > 0:
+            return True
+    return False

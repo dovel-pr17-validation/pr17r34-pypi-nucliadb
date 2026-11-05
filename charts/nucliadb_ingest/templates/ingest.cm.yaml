@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    app: ingest
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+data:
+  GRPC_PORT: {{ .Values.serving.grpc | quote }}
+  METRICS_PORT: {{ .Values.serving.metricsPort | quote }}
+  PULL_TIME_ERROR_BACKOFF: {{ .Values.config.pull_time_error_backoff | quote }}
+{{- if .Values.debug }}
+  LOG_LEVEL: "DEBUG"
+{{- end }}
+  INDEX_JETSTREAM_SERVERS: {{ toJson .Values.indexing.index_jetstream_servers | quote }}
+  INDEX_JETSTREAM_AUTH:  {{ .Values.indexing.index_jetstream_auth }}
+  TOTAL_REPLICAS: {{ .Values.replicaCount | quote }}
+{{- if .Values.tracing.enabled }}
+  {{- if .Values.tracing.otlp_collector_endpoint }}
+  OTLP_COLLECTOR_ENDPOINT: {{ .Values.tracing.otlp_collector_endpoint | quote }}
+  {{- else }}
+  JAEGER_ENABLED: "true"
+  {{- end }}
+{{- end }}

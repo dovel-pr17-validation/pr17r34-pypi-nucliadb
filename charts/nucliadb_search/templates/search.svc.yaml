@@ -1,0 +1,24 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name: search
+  labels:
+    app: search
+    metrics: "enabled"
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+spec:
+  type: ClusterIP
+  selector:
+    app: search
+  ports:
+    - name: http-search
+      port: {{ .Values.serving.port }}
+      protocol: TCP
+      appProtocol: http
+    - name: metrics
+      port: {{ .Values.serving.metricsPort}}
+      protocol: TCP
+      appProtocol: http

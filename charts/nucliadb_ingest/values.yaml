@@ -1,0 +1,202 @@
+# -----
+# NucliaDB Ingest Settings
+# -----
+
+# Image settings
+imagePullPolicy: IfNotPresent
+imageOtherPullPolicy: Always
+containerRegistry: CONTAINER_REGISTRY_TO_REPLACE
+image: IMAGE_TO_REPLACE
+
+# Component settings
+# ---
+# These settings are controlled through environment variables
+# all kubernetes oriented settings are controlled through
+# other values.
+# HOWEVER, we are in a transition period where we allow
+# both until all component settings are removed from
+# settings not mapped directly through env
+env: {}
+  # EXAMPLE: "VALUE"
+  # -- PostgreSQL connection pool max idle time in seconds
+  # DRIVER_PG_CONNECTION_POOL_MAX_IDLE_SECONDS: "300"
+  # -- PostgreSQL connection pool max lifetime in seconds
+  # DRIVER_PG_CONNECTION_POOL_MAX_LIFETIME_SECONDS: "1800"
+
+# Configmap and/or secrets to mount into the environment
+envFrom:
+  - configMapRef:
+      name: nucliadb-config #  Nucliadb-shared configMap
+  - secretRef:
+      name: nucliadb-config #  Nucliadb-shared secret
+
+# Kubernetes settings
+config:
+  pull_time_error_backoff: 100
+
+serving:
+  grpc: 8030
+  metricsPort: &metricsPort '3030'
+serviceMonitor:
+  enabled: false
+
+affinity: {}
+nodeSelector: {}
+tolerations: []
+topologySpreadConstraints: []
+podAnnotations: {}
+podLabels: {}
+replicaCount: 2
+revisionHistoryLimit: 2
+debug: False
+resources: {}
+#  limits:
+#    memory: "600Mi"
+#  requests:
+#    cpu: "300m"
+
+# Value of ports to where this component connects to
+services:
+  # This must match the pg driver on nucliadb_shared
+  maindb: 5432
+  nats: 4222
+
+running:
+  sentry_url:
+
+# secret containing NATS user credentials
+## credential names inside the secret should be consistent with
+## what's configured on nucliadb_shared
+##   .Values.transaction.transaction_jetstream_auth
+##   .Values.cache.cache_pubsub_nats_auth
+nats:
+  secretName: nats-creds
+  regionalSecretName: regional-nats-creds
+
+indexing:
+  index_jetstream_auth:
+  index_jetstream_servers:
+    - nats1
+
+ingest:
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+# ingest-orm-grpc settings
+# flat structure so no issues merging
+ingest_orm_grpc_resources:
+  requests:
+    cpu: "300m"
+    memory: "500Mi"
+ingest_orm_grpc_replicaCount: 1
+ingest_orm_grpc_autoscaling:
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+ingest_orm_grpc_podLabels: {}
+ingest_orm_grpc_podAnnotations: {}
+ingest_orm_grpc:
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+# ingest-processed-consumer settings
+ingest_processed_consumer_resources:
+  requests:
+    cpu: "300m"
+    memory: "500Mi"
+ingest_processed_consumer_replicaCount: 1
+ingest_processed_consumer_autoscaling:
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+  # behavior:
+  #   scaleDown:
+  #     stabilizationWindowSeconds: 300
+ingest_processed_consumer_podLabels: {}
+ingest_processed_consumer_podAnnotations: {}
+ingest_processed_consumer:
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+# ingest-subscriber-workers settings
+ingest_subscriber_workers_resources:
+  requests:
+    cpu: "300m"
+    memory: "500Mi"
+ingest_subscriber_workers_replicaCount: 1
+ingest_subscriber_workers_autoscaling:
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+ingest_subscriber_workers_podLabels: {}
+ingest_subscriber_workers_podAnnotations: {}
+ingest_subscriber_workers:
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+exporter:
+  podLabels: {}
+  podAnnotations: {}
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+# migrator settings
+migrator:
+  podLabels: {}
+  podAnnotations: {}
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+purgeCron:
+  serviceAccount:
+    create: false
+    name: default
+    # labels: {}
+    # annotations: {}
+
+# extra_pod_annotations:
+#   what: "add annotations"
+#   where: "in the pods"
+
+extra_cronjob_pod_labels: {}
+extra_cronjob_pod_annotations: {}
+
+tracing:
+  enabled: false
+  otlp_collector_endpoint:  # host:port of the OTLP collector, e.g. "otlp-collector-collector.observability.svc.cluster.local:4317". If blank, Jaeger is used instead.

@@ -1,0 +1,602 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+from collections.abc import AsyncGenerator, Callable, Coroutine
+from datetime import datetime
+from functools import partial
+from typing import Any
+from uuid import uuid4
+
+from nidx_protos import nidx_pb2, noderesources_pb2
+
+from nucliadb.common import datamanagers
+from nucliadb.common.cluster.utils import get_shard_manager
+from nucliadb.common.external_index_providers.base import VectorsetExternalIndex
+from nucliadb.common.maindb.driver import Driver, Transaction
+from nucliadb.common.maindb.pg import PGTransaction
+from nucliadb.common.nidx import get_nidx_api_client
+from nucliadb.ingest import SERVICE_NAME, logger
+from nucliadb.ingest.orm.exceptions import (
+    KnowledgeBoxConflict,
+    KnowledgeBoxCreationError,
+    VectorSetConflict,
+)
+from nucliadb.ingest.orm.metrics import processor_observer
+from nucliadb.ingest.orm.resource import Resource
+from nucliadb.ingest.orm.utils import choose_matryoshka_dimension, compute_paragraph_key
+from nucliadb.migrator.utils import get_latest_version
+from nucliadb_protos import knowledgebox_pb2, writer_pb2
+from nucliadb_protos.knowledgebox_pb2 import (
+    CreateExternalIndexProviderMetadata,
+    KnowledgeBoxConfig,
+    SemanticModelMetadata,
+    StoredExternalIndexProviderMetadata,
+    VectorSetPurge,
+)
+from nucliadb_protos.resources_pb2 import Basic
+from nucliadb_utils import const
+from nucliadb_utils.settings import is_onprem_nucliadb
+from nucliadb_utils.storages.storage import Storage
+from nucliadb_utils.utilities import (
+    get_audit,
+    get_storage,
+    has_feature,
+)
+
+KB_KEYS = "/kbs/{kbid}/"
+
+KB_TO_DELETE_BASE = "/kbtodelete/"
+KB_TO_DELETE_STORAGE_BASE = "/storagetodelete/"
+
+RESOURCE_TO_DELETE_STORAGE_BASE = "/resourcestoragetodelete"
+RESOURCE_TO_DELETE_STORAGE = f"{RESOURCE_TO_DELETE_STORAGE_BASE}/{{kbid}}/{{uuid}}"
+
+KB_TO_DELETE = f"{KB_TO_DELETE_BASE}{{kbid}}"
+KB_TO_DELETE_STORAGE = f"{KB_TO_DELETE_STORAGE_BASE}{{kbid}}"
+
+KB_VECTORSET_TO_DELETE_BASE = "/vectorsettodelete"
+KB_VECTORSET_TO_DELETE = f"{KB_VECTORSET_TO_DELETE_BASE}/{{kbid}}/{{vectorset}}"
+
+
+def semantic_model_to_vectorset(
+    model_name: str, model: SemanticModelMetadata, dimension: int | None = None
+) -> knowledgebox_pb2.VectorSetConfig:
+    return knowledgebox_pb2.VectorSetConfig(
+        vectorset_id=model_name,
+        vectorset_index_config=knowledgebox_pb2.VectorIndexConfig(
+            similarity=model.similarity_function,
+            vector_type=knowledgebox_pb2.VectorType.DENSE_F32,
+            normalize_vectors=len(model.matryoshka_dimensions) > 0,
+            vector_dimension=dimension or model.vector_dimension,
+        ),
+        matryoshka_dimensions=model.matryoshka_dimensions,
+        storage_key_kind=knowledgebox_pb2.VectorSetConfig.StorageKeyKind.VECTORSET_PREFIX,
+    )
+
+
+class KnowledgeBox:
+    def __init__(self, txn: Transaction, storage: Storage, kbid: str):
+        self.txn = txn
+        self.storage = storage
+        self.kbid = kbid
+        self._config: KnowledgeBoxConfig | None = None
+
+    @staticmethod
+    def new_unique_kbid() -> str:
+        return str(uuid4())
+
+    @classmethod
+    @processor_observer.wrap({"type": "create_kb"})
+    async def create(
+        cls,
+        driver: Driver,
+        *,
+        kbid: str,
+        slug: str,
+        semantic_models: dict[str, SemanticModelMetadata],
+        title: str = "",
+        description: str = "",
+        external_index_provider: CreateExternalIndexProviderMetadata = CreateExternalIndexProviderMetadata(),
+        hidden_resources_enabled: bool = False,
+        hidden_resources_hide_on_creation: bool = False,
+        prewarm_enabled: bool = False,
+        semantic_graph_node_models: dict[str, SemanticModelMetadata] = dict(),
+        semantic_graph_edge_models: dict[str, SemanticModelMetadata] = dict(),
+        enforce_security: bool | None = None,
+    ) -> tuple[str, str]:
+        """Creates a new knowledge box and return its id and slug."""
+
+        if not kbid:
+            raise KnowledgeBoxCreationError("A kbid must be provided to create a new KB")
+        if not slug:
+            raise KnowledgeBoxCreationError("A slug must be provided to create a new KB")
+        if hidden_resources_hide_on_creation and not hidden_resources_enabled:
+            raise KnowledgeBoxCreationError(
+                "Cannot hide new resources if the hidden resources feature is disabled"
+            )
+        if len(semantic_models) == 0:
+            raise KnowledgeBoxCreationError("KB must define at least one semantic model")
+
+        rollback_ops: list[Callable[[], Coroutine[Any, Any, Any]]] = []
+
+        try:
+            async with driver.rw_transaction() as txn:
+                if await datamanagers.kb.exists(txn, kbid=kbid):
+                    raise KnowledgeBoxConflict("KB with this kbid already exists")
+
+                # Create in maindb
+                try:
+                    await datamanagers.kb.set_slug(txn, slug=slug, kbid=kbid)
+                except datamanagers.exceptions.KnowledgeBoxConflict as e:
+                    raise KnowledgeBoxConflict("Slug already exists") from e
+
+                # all KBs have the vectorset key initialized, although (for
+                # now), not every KB will store vectorsets there
+                await datamanagers.vectorsets.initialize(txn, kbid=kbid)
+
+                kb_shards = writer_pb2.Shards()
+                kb_shards.kbid = kbid
+                # B/c with Shards.actual
+                kb_shards.actual = -1
+
+                vs_external_indexes = []
+
+                for vectorset_id, semantic_model in semantic_models.items():
+                    # if this KB uses a matryoshka model, we can choose a different
+                    # dimension
+                    if len(semantic_model.matryoshka_dimensions) > 0:
+                        dimension = choose_matryoshka_dimension(semantic_model.matryoshka_dimensions)
+                    else:
+                        dimension = semantic_model.vector_dimension
+
+                    vs_external_indexes.append(
+                        VectorsetExternalIndex(
+                            vectorset_id=vectorset_id,
+                            dimension=dimension,
+                            similarity=semantic_model.similarity_function,
+                        )
+                    )
+
+                    vectorset_config = semantic_model_to_vectorset(
+                        vectorset_id, semantic_model, dimension
+                    )
+                    await datamanagers.vectorsets.set(txn, kbid=kbid, config=vectorset_config)
+
+                if has_feature(const.Features.SEMANTIC_GRAPH):
+                    if semantic_graph_node_models:
+                        await datamanagers.graph_vectorsets.node.set_all(
+                            txn,
+                            kbid=kbid,
+                            configs=[
+                                semantic_model_to_vectorset(name, model)
+                                for name, model in semantic_graph_node_models.items()
+                            ],
+                        )
+
+                    if semantic_graph_edge_models:
+                        await datamanagers.graph_vectorsets.edge.set_all(
+                            txn,
+                            kbid=kbid,
+                            configs=[
+                                semantic_model_to_vectorset(name, model)
+                                for name, model in semantic_graph_edge_models.items()
+                            ],
+                        )
+
+                stored_external_index_provider = await cls._maybe_create_external_indexes(
+                    kbid, request=external_index_provider, indexes=vs_external_indexes
+                )
+                rollback_ops.append(
+                    partial(
+                        cls._maybe_delete_external_indexes,
+                        kbid,
+                        stored_external_index_provider,
+                    )
+                )
+
+                config = KnowledgeBoxConfig(
+                    title=title,
+                    description=description,
+                    slug=slug,
+                    migration_version=get_latest_version(),
+                    hidden_resources_enabled=hidden_resources_enabled,
+                    hidden_resources_hide_on_creation=hidden_resources_hide_on_creation,
+                    enforce_security=enforce_security if enforce_security is not None else False,
+                    prewarm_enabled=prewarm_enabled,
+                )
+                config.external_index_provider.CopyFrom(stored_external_index_provider)
+                await datamanagers.kb.set(txn, kbid=kbid, shards=kb_shards, config=config)
+
+                # shard creation will alter this value on maindb, make sure nobody
+                # uses this variable anymore
+                del kb_shards
+
+                # Create in storage
+
+                storage = await get_storage(service_name=SERVICE_NAME)
+
+                created = await storage.create_kb(kbid)
+                if not created:
+                    logger.error(f"KB {kbid} could not be created")
+                    raise KnowledgeBoxCreationError(
+                        f"KB blob storage could not be created (slug={slug})"
+                    )
+                rollback_ops.append(partial(storage.delete_kb, kbid))
+
+                # Create shards in index nodes
+
+                shard_manager = get_shard_manager()
+                # XXX creating a shard is a slow IO operation that requires a write
+                # txn to be open!
+                await shard_manager.create_shard_by_kbid(txn, kbid, prewarm_enabled=prewarm_enabled)
+                # shards don't need a rollback as they will be eventually purged
+
+                await txn.commit()
+
+        except Exception as exc:
+            # rollback all changes on the db and raise the exception
+            for op in reversed(rollback_ops):
+                try:
+                    await op()
+                except Exception:
+                    if isinstance(op, partial):
+                        name: str = getattr(op.func, "__name__", "unknown?")
+                    else:
+                        getattr(op, "__name__", "unknown?")
+                    logger.exception(f"Unexpected error rolling back {name}. Keep rolling back")
+            raise exc
+
+        return (kbid, slug)
+
+    @classmethod
+    async def update(
+        cls,
+        driver: Driver,
+        kbid: str,
+        *,
+        slug: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        migration_version: int | None = None,
+        external_index_provider: StoredExternalIndexProviderMetadata | None = None,
+        hidden_resources_enabled: bool | None = None,
+        hidden_resources_hide_on_creation: bool | None = None,
+        prewarm_enabled: bool | None = None,
+        enforce_security: bool | None = None,
+    ) -> str:
+        async with driver.rw_transaction() as txn:
+            stored = await datamanagers.kb.get_config(txn, kbid=kbid, for_update=True)
+            if not stored:
+                raise datamanagers.exceptions.KnowledgeBoxNotFound()
+
+            if slug:
+                try:
+                    await datamanagers.kb.set_slug(txn, slug=slug, kbid=kbid)
+                except datamanagers.exceptions.KnowledgeBoxConflict as e:
+                    raise KnowledgeBoxConflict("Slug already exists") from e
+                stored.slug = slug
+
+            if title is not None:
+                stored.title = title
+            if description is not None:
+                stored.description = description
+
+            if migration_version is not None:
+                stored.migration_version = migration_version
+
+            if external_index_provider is not None:
+                stored.external_index_provider.MergeFrom(external_index_provider)
+
+            if hidden_resources_enabled is not None:
+                stored.hidden_resources_enabled = hidden_resources_enabled
+            if hidden_resources_hide_on_creation is not None:
+                stored.hidden_resources_hide_on_creation = hidden_resources_hide_on_creation
+
+            update_nidx_prewarm = None
+            if prewarm_enabled is not None:
+                if stored.prewarm_enabled != prewarm_enabled:
+                    update_nidx_prewarm = prewarm_enabled
+                stored.prewarm_enabled = prewarm_enabled
+
+            if stored.hidden_resources_hide_on_creation and not stored.hidden_resources_enabled:
+                raise KnowledgeBoxCreationError(
+                    "Cannot hide new resources if the hidden resources feature is disabled"
+                )
+
+            if enforce_security is not None:
+                stored.enforce_security = enforce_security
+
+            await datamanagers.kb.set(txn, kbid=kbid, config=stored)
+
+            await txn.commit()
+
+        if update_nidx_prewarm is not None:
+            await cls.configure_shards(driver, kbid, prewarm=update_nidx_prewarm)
+
+        return kbid
+
+    @classmethod
+    async def configure_shards(cls, driver: Driver, kbid: str, *, prewarm: bool):
+        shards_obj = await datamanagers.atomic.kb.get_shards(kbid=kbid)
+        if shards_obj is None:
+            logger.warning(f"Shards not found for KB while updating pre-warm flag", extra={"kbid": kbid})
+            return
+
+        nidx_shard_ids = [shard.nidx_shard_id for shard in shards_obj.shards]
+
+        nidx_api = get_nidx_api_client()
+        if nidx_api is not None and len(nidx_shard_ids) > 0:
+            configs = [
+                nidx_pb2.ShardConfig(
+                    shard_id=shard_id,
+                    prewarm_enabled=prewarm,
+                )
+                for shard_id in nidx_shard_ids
+            ]
+            await nidx_api.ConfigureShards(nidx_pb2.ShardsConfig(configs=configs))
+
+    @classmethod
+    async def mark_for_purge(cls, txn: Transaction, kbid: str):
+        """
+        Mark KB to purge. Purge command will eventually delete all KB keys and objects in storage.
+        """
+        key = KB_TO_DELETE.format(kbid=kbid)
+        value = datetime.now().isoformat().encode()
+        await txn.set(key, value)
+
+    @classmethod
+    async def unmark_for_purge(cls, txn: Transaction, kbid: str):
+        """
+        Unmark KB to purge. To be called after purge is completed, to remove the KB from the list of KBs to purge.
+        """
+        key = KB_TO_DELETE.format(kbid=kbid)
+        await txn.delete(key)
+
+    @classmethod
+    async def delete(cls, driver: Driver, kbid: str):
+        """
+        Delete a knowledge base (KB) and all its associated data.
+
+        In the current transaction, the KB is marked for and we only delete:
+        - The KB config
+        - The KB slug
+        - Mark shards to be deleted from nidx
+        - Mark the KB for purge, which will eventually delete all KB keys in Postgresql and objects in storage.
+        """
+
+        async with driver.rw_transaction() as txn:
+            exists = await datamanagers.kb.exists(txn, kbid=kbid)
+            if not exists:
+                # Already deleted, or never existed.
+                return
+
+            kb_config = await datamanagers.kb.get_config(txn, kbid=kbid)
+
+            await cls.mark_for_purge(txn, kbid=kbid)
+
+            shards_obj = await datamanagers.kb.get_shards(txn, kbid=kbid)
+
+            await datamanagers.kb.soft_delete(txn, kbid=kbid)
+
+            await txn.commit()
+
+        if shards_obj is None:
+            logger.warning(f"Shards not found for KB while deleting it", extra={"kbid": kbid})
+        else:
+            nidx_api = get_nidx_api_client()
+            # Delete shards from nidx. They'll be marked for eventual deletion,
+            # so this call shouldn't be costly
+            if nidx_api is not None:
+                for shard in shards_obj.shards:
+                    if shard.nidx_shard_id:
+                        await nidx_api.DeleteShard(noderesources_pb2.ShardId(id=shard.nidx_shard_id))
+
+        if kb_config is not None:
+            await cls._maybe_delete_external_indexes(kbid, kb_config.external_index_provider)
+
+        audit = get_audit()
+        if audit is not None:
+            audit.delete_kb(kbid=kbid)
+
+        return kbid
+
+    @classmethod
+    async def purge(cls, driver: Driver, kbid: str):
+        """
+        Deletes all kb parts
+
+        Removes all catalog entries related to the kb.
+
+        As non-empty buckets cannot be deleted, they are scheduled to be
+        deleted instead. Actually, this empties the bucket asynchronouysly
+        but it doesn't delete it. To do it, we save a marker using the
+        KB_TO_DELETE_STORAGE key, so then purge cronjob will keep trying
+        to delete once the emptying have been completed.
+        """
+        storage = await get_storage(service_name=SERVICE_NAME)
+        exists = await storage.schedule_delete_kb(kbid)
+        if exists is False:
+            logger.error(f"{kbid} KB does not exists on Storage")
+
+        async with driver.rw_transaction() as txn:
+            # Mark storage to be deleted. This will
+            storage_to_delete = KB_TO_DELETE_STORAGE.format(kbid=kbid)
+            await txn.set(storage_to_delete, b"")
+
+            await catalog_delete_kb(txn, kbid)
+            await txn.commit()
+
+        # Delete by prefix in another transaction, as it can be slow and we don't want to block the previous one
+        async with driver.rw_transaction() as txn:
+            await cls.delete_all_kb_keys(txn, kbid)
+            await txn.commit()
+
+    @classmethod
+    async def delete_all_kb_keys(cls, txn: Transaction, kbid: str):
+        prefix = KB_KEYS.format(kbid=kbid)
+        await txn.delete_by_prefix(prefix)
+        await datamanagers.kb.delete(txn, kbid=kbid)
+
+    async def get_resource_shard(self, shard_id: str) -> writer_pb2.ShardObject | None:
+        async with datamanagers.with_ro_transaction() as txn:
+            pb = await datamanagers.kb.get_shards(txn, kbid=self.kbid)
+            if pb is None:
+                logger.warning("Shards not found for kbid", extra={"kbid": self.kbid})
+                return None
+        for shard in pb.shards:
+            if shard.shard == shard_id:
+                return shard
+        return None
+
+    async def get(self, uuid: str) -> Resource | None:
+        return await Resource.get(self.txn, self.kbid, uuid)
+
+    async def maindb_delete_resource(self, uuid: str):
+        await datamanagers.resources.delete(self.txn, kbid=self.kbid, rid=uuid)
+
+    async def storage_delete_resource(self, uuid: str):
+        if is_onprem_nucliadb():
+            await self.storage.delete_resource(self.kbid, uuid)
+        else:
+            # Deleting from storage can be slow, so we schedule its deletion and the purge cronjob
+            # will take care of it. This is OK as resource uuids are unique and not reused.
+            await self.schedule_delete_resource(self.kbid, uuid)
+
+    async def schedule_delete_resource(self, kbid: str, uuid: str):
+        key = RESOURCE_TO_DELETE_STORAGE.format(kbid=kbid, uuid=uuid)
+        await self.txn.set(key, b"")
+
+    async def delete_resource(self, uuid: str):
+        with processor_observer({"type": "delete_resource_maindb"}):
+            await self.maindb_delete_resource(uuid)
+        with processor_observer({"type": "delete_resource_storage"}):
+            await self.storage_delete_resource(uuid)
+
+    async def get_resource_uuid_by_slug(self, slug: str) -> str | None:
+        return await datamanagers.resources.get_rid(self.txn, kbid=self.kbid, slug=slug)
+
+    async def add_resource(self, uuid: str, slug: str, basic: Basic | None = None) -> Resource:
+        if basic is None:
+            basic = Basic()
+        if slug == "":
+            slug = uuid
+        basic.slug = slug
+        fix_paragraph_annotation_keys(uuid, basic)
+        await datamanagers.resources.set(self.txn, kbid=self.kbid, rid=uuid, basic=basic)
+        return Resource(
+            storage=self.storage,
+            txn=self.txn,
+            kbid=self.kbid,
+            uuid=uuid,
+            basic=basic,
+            disable_vectors=False,
+        )
+
+    async def iterate_resources(self) -> AsyncGenerator[Resource, None]:
+        # This uses a separate transaction for iterating resource ids
+        async for uuid in datamanagers.resources.iter(kbid=self.kbid):
+            yield Resource(
+                self.txn,
+                self.storage,
+                self.kbid,
+                uuid,
+                disable_vectors=False,
+            )
+
+    async def create_vectorset(self, config: knowledgebox_pb2.VectorSetConfig):
+        if await datamanagers.vectorsets.exists(
+            self.txn, kbid=self.kbid, vectorset_id=config.vectorset_id
+        ):
+            raise VectorSetConflict(f"Vectorset {config.vectorset_id} already exists")
+
+        # To ensure we always set the storage key kind, we overwrite it with the
+        # correct value. This whole enum business is to maintain bw/c with KBs
+        # pre-vectorsets, so any new vectorset should use the vectorset prefix
+        # key kind
+        config.storage_key_kind = knowledgebox_pb2.VectorSetConfig.StorageKeyKind.VECTORSET_PREFIX
+        await datamanagers.vectorsets.set(self.txn, kbid=self.kbid, config=config)
+
+        # Remove the async deletion mark if it exists, just in case there was a previous deletion
+        deletion_mark_key = KB_VECTORSET_TO_DELETE.format(kbid=self.kbid, vectorset=config.vectorset_id)
+        deletion_mark = await self.txn.get(deletion_mark_key, for_update=True)
+        if deletion_mark is not None:
+            await self.txn.delete(deletion_mark_key)
+
+        shard_manager = get_shard_manager()
+        await shard_manager.create_vectorset(self.kbid, config)
+
+    async def vectorset_marked_for_deletion(self, vectorset_id: str) -> bool:
+        key = KB_VECTORSET_TO_DELETE.format(kbid=self.kbid, vectorset=vectorset_id)
+        value = await self.txn.get(key)
+        return value is not None
+
+    async def delete_vectorset(self, vectorset_id: str):
+        deleted = await datamanagers.vectorsets.delete(
+            self.txn, kbid=self.kbid, vectorset_id=vectorset_id
+        )
+        if deleted is None:
+            # already deleted
+            return
+
+        vectorset_count = await datamanagers.vectorsets.count(self.txn, kbid=self.kbid)
+        if vectorset_count == 0:
+            raise VectorSetConflict("Deletion of your last vectorset is not allowed")
+
+        # mark vectorset for async deletion
+        deletion_mark_key = KB_VECTORSET_TO_DELETE.format(kbid=self.kbid, vectorset=vectorset_id)
+        payload = VectorSetPurge(storage_key_kind=deleted.storage_key_kind)
+        await self.txn.set(deletion_mark_key, payload.SerializeToString())
+
+        shard_manager = get_shard_manager()
+        await shard_manager.delete_vectorset(self.kbid, vectorset_id)
+
+    @classmethod
+    async def _maybe_create_external_indexes(
+        cls,
+        kbid: str,
+        request: CreateExternalIndexProviderMetadata,
+        indexes: list[VectorsetExternalIndex],
+    ) -> StoredExternalIndexProviderMetadata:
+        return StoredExternalIndexProviderMetadata(type=request.type)
+
+    @classmethod
+    async def _maybe_delete_external_indexes(
+        cls,
+        kbid: str,
+        stored: StoredExternalIndexProviderMetadata,
+    ) -> None:
+        return
+
+
+def fix_paragraph_annotation_keys(uuid: str, basic: Basic) -> None:
+    # For the case when you want to create a resource with already labeled paragraphs (on the same request),
+    # the user is expected to use N_RID as uuid of the resource in the annotation key (as the uuid of the
+    # resource hasn't been computed yet). This code will fix the keys so that they point to the assigned uuid.
+    for ufm in basic.fieldmetadata:
+        for paragraph_annotation in ufm.paragraphs:
+            key = compute_paragraph_key(uuid, paragraph_annotation.key)
+            paragraph_annotation.key = key
+
+
+@processor_observer.wrap({"type": "catalog_delete_kb"})
+async def catalog_delete_kb(txn: Transaction, kbid: str):
+    if not isinstance(txn, PGTransaction):
+        return
+    async with txn.connection.cursor() as cur:
+        await cur.execute("DELETE FROM catalog where kbid = %(kbid)s", {"kbid": kbid})

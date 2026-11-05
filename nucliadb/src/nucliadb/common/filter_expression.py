@@ -1,0 +1,519 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+from datetime import datetime
+from typing import Type, assert_never, cast
+
+from nidx_protos import nodereader_pb2
+from nidx_protos.nodereader_pb2 import FilterExpression as PBFilterExpression
+
+from nucliadb.common import datamanagers
+from nucliadb.common.exceptions import InvalidQueryError
+from nucliadb.common.ids import FIELD_TYPE_NAME_TO_STR
+from nucliadb_models.common import Paragraph
+from nucliadb_models.filters import (
+    And,
+    Contains,
+    DateCreated,
+    DateModified,
+    Entity,
+    Eq,
+    Field,
+    FieldFilterExpressionType,
+    FieldMimetype,
+    Generated,
+    Inequalities,
+    Keyword,
+    Kind,
+    KVFilterExpressionType,
+    Label,
+    Language,
+    Not,
+    Or,
+    OriginCollaborator,
+    OriginMetadata,
+    OriginPath,
+    OriginSource,
+    OriginTag,
+    ParagraphFilterExpressionType,
+    Resource,
+    ResourceFieldPrefix,
+    ResourceFilterExpressionType,
+    ResourceMimetype,
+    Status,
+)
+from nucliadb_models.kv_schemas import KBKVSchemas, KVFieldType
+from nucliadb_models.metadata import ResourceProcessingStatus
+
+# Filters that end up as a facet
+FacetFilter = (
+    OriginTag
+    | Label
+    | ResourceMimetype
+    | FieldMimetype
+    | Entity
+    | Language
+    | OriginMetadata
+    | OriginPath
+    | Generated
+    | Kind
+    | OriginCollaborator
+    | OriginSource
+    | Status
+)
+
+
+async def parse_expression(
+    expr: ResourceFilterExpressionType | FieldFilterExpressionType | ParagraphFilterExpressionType,
+    kbid: str,
+) -> PBFilterExpression:
+    f = PBFilterExpression()
+
+    _ExprType = ResourceFilterExpressionType | FieldFilterExpressionType | ParagraphFilterExpressionType
+    if isinstance(expr, And):
+        for op in expr.operands:
+            f.bool_and.operands.append(await parse_expression(cast(_ExprType, op), kbid))
+    elif isinstance(expr, Or):
+        for op in expr.operands:
+            f.bool_or.operands.append(await parse_expression(cast(_ExprType, op), kbid))
+    elif isinstance(expr, Not):
+        f.bool_not.CopyFrom(await parse_expression(cast(_ExprType, expr.operand), kbid))
+    elif isinstance(expr, Resource):
+        if expr.id:
+            f.resource.resource_id = expr.id
+        elif expr.slug:
+            rid = await datamanagers.atomic.resources.get_rid(kbid=kbid, slug=expr.slug)
+            if rid is None:
+                raise InvalidQueryError("slug", f"Cannot find slug {expr.slug}")
+            f.resource.resource_id = rid
+        else:  # pragma: no cover
+            # Cannot happen due to model validation
+            raise ValueError("Resource needs id or slug")
+    elif isinstance(expr, Field):
+        f.field.field_type = FIELD_TYPE_NAME_TO_STR[expr.type]
+        if expr.name:
+            f.field.field_id = expr.name
+    elif isinstance(expr, ResourceFieldPrefix):
+        if expr.resource_id:
+            f.resource_field_prefix.resource_id = expr.resource_id
+        elif expr.resource_slug:
+            rid = await datamanagers.atomic.resources.get_rid(kbid=kbid, slug=expr.resource_slug)
+            if rid is None:
+                raise InvalidQueryError("slug", f"Cannot find slug {expr.resource_slug}")
+            f.resource_field_prefix.resource_id = rid
+        else:
+            # Cannot happen due to model validation
+            raise ValueError("ResourceFieldPrefix needs resource_id or resource_slug")
+        f.resource_field_prefix.field_type = FIELD_TYPE_NAME_TO_STR[expr.field_type]
+        f.resource_field_prefix.field_id_prefix = expr.field_name_prefix
+    elif isinstance(expr, Keyword):
+        f.keyword.keyword = expr.word
+    elif isinstance(expr, DateCreated):
+        f.date.field = PBFilterExpression.DateRangeFilter.DateField.CREATED
+        if expr.since:
+            f.date.since.FromDatetime(expr.since)
+        if expr.until:
+            f.date.until.FromDatetime(expr.until)
+    elif isinstance(expr, DateModified):
+        f.date.field = PBFilterExpression.DateRangeFilter.DateField.MODIFIED
+        if expr.since:
+            f.date.since.FromDatetime(expr.since)
+        if expr.until:
+            f.date.until.FromDatetime(expr.until)
+    elif isinstance(expr, FacetFilter):
+        f.facet.facet = facet_from_filter(expr)
+    else:  # pragma: no cover
+        assert_never(expr)
+
+    return f
+
+
+async def parse_kv_expression(
+    expr: KVFilterExpressionType,
+    kbid: str,
+) -> nodereader_pb2.JsonFilterExpression:
+    """Convert a key-value filter expression tree into it's proto
+    representation, validating types against the corresponding key-value schemas
+    used
+
+    """
+    async with datamanagers.with_ro_transaction() as txn:
+        all_schemas = await datamanagers.kv_schemas.get_all(txn, kbid=kbid)
+    return _parse_kv_expression(expr, all_schemas)
+
+
+# Map between an operator and the possible schema field types. This is must be
+# synchronized with the types the operators have, e.g. `Eq.eq` types
+KEY_VALUE_ALLOWED_TYPES: dict[Type[Eq] | Type[Inequalities] | Type[Contains], set[KVFieldType]] = {
+    Eq: {
+        KVFieldType.TEXT,
+        KVFieldType.INTEGER,
+        KVFieldType.FLOAT,
+        KVFieldType.BOOLEAN,
+        KVFieldType.DATE,
+    },
+    Inequalities: {KVFieldType.INTEGER, KVFieldType.FLOAT, KVFieldType.DATE},
+    Contains: {KVFieldType.TEXT, KVFieldType.INTEGER, KVFieldType.FLOAT, KVFieldType.DATE},
+}
+
+# Map from Python types a value can have and which key-value field types can be
+# used on. For example, an int value can be used in an int/float/range types
+KV_VALUE_FIELD_TYPES: dict[type, list[KVFieldType]] = {
+    str: [KVFieldType.TEXT],
+    bool: [KVFieldType.BOOLEAN],
+    float: [KVFieldType.FLOAT],
+    int: [KVFieldType.INTEGER, KVFieldType.FLOAT],
+    datetime: [KVFieldType.DATE],
+}
+
+
+def _validate_kv_schema(
+    schemas: KBKVSchemas,
+    expr: Eq | Inequalities | Contains,
+) -> None:
+    schema = schemas.schemas.get(expr.schema_id)
+    if schema is None:
+        raise InvalidQueryError("key_value", f"Unknown key-value schema: '{expr.schema_id}'")
+    field_map = {f.key: f for f in schema.fields}
+    if expr.key not in field_map:
+        raise InvalidQueryError(
+            "key_value",
+            f"Key '{expr.key}' not found in schema '{expr.schema_id}'",
+        )
+    schema_field = field_map[expr.key]
+
+    # validate operator is applicable for the field type
+    allowed_types = KEY_VALUE_ALLOWED_TYPES[type(expr)]
+    if schema_field.type not in allowed_types:
+        allowed = " or".join([f"'{type}'" for type in allowed_types])
+        raise InvalidQueryError(
+            "key_value",
+            f"Key '{expr.key}' in schema '{expr.schema_id}' is of type '{schema_field.type}', "
+            f"but '{type(expr).__name__.lower()}' requires type {allowed}",
+        )
+
+    if schema_field.range or schema_field.repeated:
+        # validate range and repeated fields use valid range operators
+        if type(expr) not in {
+            Contains,
+        }:
+            raise InvalidQueryError(
+                "key_value",
+                f"Key '{expr.key}' in schema '{expr.schema_id}' is not a range type. "
+                f"Therefore '{type(expr).__name__.lower()}' can't be used",
+            )
+    else:
+        # validate non-range or non-repeated fields don't use range operators
+        if type(expr) in {
+            Contains,
+        }:
+            raise InvalidQueryError(
+                "key_value",
+                f"Key '{expr.key}' in schema '{expr.schema_id}' is not a range type. "
+                f"Therefore '{type(expr).__name__.lower()}' can't be used",
+            )
+
+    # validate value type(s) match the field type
+    expected_field_types = KV_VALUE_FIELD_TYPES.get(expr._value_type())
+    assert expected_field_types is not None, "missing a type in the key-value field types dict!"
+    if schema_field.type not in expected_field_types:
+        invalid_type = expected_field_types[0]
+        raise InvalidQueryError(
+            "key_value",
+            f"Key '{schema_field.key}' in schema '{expr.schema_id}' is of type '{schema_field.type}', "
+            f"but '{invalid_type} has been provided",
+        )
+
+
+def _set_range_bound(
+    path: nodereader_pb2.JsonFieldPathFilter,
+    value: int | float | datetime,
+    lower: bool = False,
+) -> None:
+    if isinstance(value, float):
+        if lower:
+            path.float_range.lower = value
+        else:
+            path.float_range.upper = value
+    elif isinstance(value, int):
+        if lower:
+            path.int_range.lower = value
+        else:
+            path.int_range.upper = value
+    elif isinstance(value, datetime):
+        if lower:
+            path.date_range.lower.FromDatetime(value)
+        else:
+            path.date_range.upper.FromDatetime(value)
+    else:  # pragma: no cover
+        assert_never(value)
+
+
+def _parse_kv_expression(
+    expr: KVFilterExpressionType,
+    schemas: KBKVSchemas,
+) -> nodereader_pb2.JsonFilterExpression:
+    json_filter = nodereader_pb2.JsonFilterExpression()
+
+    if isinstance(expr, And):
+        json_filter.bool_and.operands.extend(
+            [_parse_kv_expression(cast(KVFilterExpressionType, op), schemas) for op in expr.operands]
+        )
+    elif isinstance(expr, Or):
+        json_filter.bool_or.operands.extend(
+            [_parse_kv_expression(cast(KVFilterExpressionType, op), schemas) for op in expr.operands]
+        )
+    elif isinstance(expr, Not):
+        json_filter.bool_not.CopyFrom(
+            _parse_kv_expression(cast(KVFilterExpressionType, expr.operand), schemas)
+        )
+
+    elif isinstance(expr, Eq):
+        _validate_kv_schema(schemas, expr)
+
+        json_filter.path.field_id = f"k/{expr.schema_id}"
+        json_filter.path.json_path = expr.key
+
+        match expr.eq:
+            case str():
+                json_filter.path.text = expr.eq
+            case bool():
+                json_filter.path.boolean = expr.eq
+            case float():
+                json_filter.path.float = expr.eq
+            case int():
+                json_filter.path.int = expr.eq
+            case datetime():
+                json_filter.path.date.FromDatetime(expr.eq)
+            case _:  # pragma: no cover
+                assert_never(expr.eq)
+
+    elif isinstance(expr, Inequalities):
+        _validate_kv_schema(schemas, expr)
+
+        json_filter.path.field_id = f"k/{expr.schema_id}"
+        json_filter.path.json_path = expr.key
+
+        if expr.gte is not None:
+            _set_range_bound(json_filter.path, expr.gte, lower=True)
+        if expr.lte is not None:
+            _set_range_bound(json_filter.path, expr.lte, lower=False)
+
+    elif isinstance(expr, Contains):
+        _validate_kv_schema(schemas, expr)
+
+        # NOTE range and repeated field types don't overlap and that's why this is ok
+        if isinstance(expr.contains, str):
+            json_filter.path.field_id = f"k/{expr.schema_id}"
+            json_filter.path.json_path = expr.key
+            json_filter.path.text = expr.contains
+        else:
+            lower_bound = nodereader_pb2.JsonFilterExpression()
+            upper_bound = nodereader_pb2.JsonFilterExpression()
+
+            lower_bound.path.field_id = f"k/{expr.schema_id}"
+            upper_bound.path.field_id = f"k/{expr.schema_id}"
+            lower_bound.path.json_path = f"{expr.key}.min"
+            upper_bound.path.json_path = f"{expr.key}.max"
+
+            # we want our value to be >= the lower bound and <= the upper bound
+            _set_range_bound(lower_bound.path, expr.contains, lower=False)
+            _set_range_bound(upper_bound.path, expr.contains, lower=True)
+
+            json_filter.bool_and.operands.extend([lower_bound, upper_bound])
+
+    else:  # pragma: no cover
+        assert_never(expr)
+
+    return json_filter
+
+
+def facet_from_filter(expr: FacetFilter) -> str:
+    if isinstance(expr, OriginTag):
+        facet = f"/t/{expr.tag}"
+    elif isinstance(expr, Label):
+        facet = f"/l/{expr.labelset}"
+        if expr.label:
+            facet += f"/{expr.label}"
+    elif isinstance(expr, ResourceMimetype):
+        facet = f"/n/i/{expr.type}"
+        if expr.subtype:
+            facet += f"/{expr.subtype}"
+    elif isinstance(expr, FieldMimetype):
+        facet = f"/mt/{expr.type}"
+        if expr.subtype:
+            facet += f"/{expr.subtype}"
+    elif isinstance(expr, Entity):
+        facet = f"/e/{expr.subtype}"
+        if expr.value:
+            facet += f"/{expr.value}"
+    elif isinstance(expr, Language):
+        if expr.only_primary:
+            facet = f"/s/p/{expr.language}"
+        else:
+            facet = f"/s/s/{expr.language}"
+    elif isinstance(expr, OriginMetadata):
+        facet = f"/m/{expr.field}"
+        if expr.value:
+            facet += f"/{expr.value}"
+    elif isinstance(expr, OriginPath):
+        facet = "/p"
+        if expr.prefix:
+            # Remove leading/trailing slashes for better compatibility
+            clean_prefix = expr.prefix.strip("/")
+            facet += f"/{clean_prefix}"
+    elif isinstance(expr, Generated):
+        facet = "/g/da"
+        if expr.da_task:
+            facet += f"/{expr.da_task}"
+    elif isinstance(expr, Kind):
+        facet = f"/k/{expr.kind.lower()}"
+    elif isinstance(expr, OriginCollaborator):
+        facet = f"/u/o/{expr.collaborator}"
+    elif isinstance(expr, OriginSource):
+        facet = "/u/s"
+        if expr.id:
+            facet += f"/{expr.id}"
+    elif isinstance(expr, Status):
+        facet = f"/n/s/{expr.status.value}"
+    else:  # pragma: no cover
+        assert_never(expr)
+
+    return facet
+
+
+def filter_from_facet(facet: str) -> FacetFilter:
+    expr: FacetFilter
+
+    if facet.startswith("/t/"):
+        value = facet.removeprefix("/t/")
+        expr = OriginTag(tag=value)
+
+    elif facet.startswith("/l/"):
+        value = facet.removeprefix("/l/")
+        parts = value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            type = parts[0]
+            expr = Label(labelset=type)
+        else:
+            type, subtype = parts
+            expr = Label(labelset=type, label=subtype)
+
+    elif facet.startswith("/n/i/"):
+        value = facet.removeprefix("/n/i/")
+        parts = value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            type = parts[0]
+            expr = ResourceMimetype(type=type)
+        else:
+            type, subtype = parts
+            expr = ResourceMimetype(type=type, subtype=subtype)
+
+    elif facet.startswith("/mt/"):
+        value = facet.removeprefix("/mt/")
+        parts = value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            type = parts[0]
+            expr = FieldMimetype(type=type)
+        else:
+            type, subtype = parts
+            expr = FieldMimetype(type=type, subtype=subtype)
+
+    elif facet.startswith("/e/"):
+        value = facet.removeprefix("/e/")
+        parts = value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            subtype = parts[0]
+            expr = Entity(subtype=subtype)
+        else:
+            subtype, value = parts
+            expr = Entity(subtype=subtype, value=value)
+
+    elif facet.startswith("/s/p"):
+        value = facet.removeprefix("/s/p/")
+        expr = Language(language=value, only_primary=True)
+
+    elif facet.startswith("/s/s"):
+        value = facet.removeprefix("/s/s/")
+        expr = Language(language=value, only_primary=False)
+
+    elif facet.startswith("/m/"):
+        value = facet.removeprefix("/m/")
+        parts = value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            field = parts[0]
+            expr = OriginMetadata(field=field)
+        else:
+            field, value = parts
+            expr = OriginMetadata(field=field, value=value)
+
+    elif facet.startswith("/p/"):
+        value = facet.removeprefix("/p/")
+        expr = OriginPath(prefix=value)
+
+    elif facet.startswith("/g/da"):
+        value = facet.removeprefix("/g/da")
+        expr = expr = Generated(by="data-augmentation")
+        if value.removeprefix("/"):
+            expr.da_task = value.removeprefix("/")
+
+    elif facet.startswith("/k/"):
+        value = facet.removeprefix("/k/")
+        try:
+            kind = Paragraph.TypeParagraph(value.upper())
+        except ValueError:
+            raise InvalidQueryError("filters", f"invalid paragraph kind: {value}")
+        expr = Kind(kind=kind)
+
+    elif facet.startswith("/u/o/"):
+        value = facet.removeprefix("/u/o/")
+        expr = OriginCollaborator(collaborator=value)
+
+    elif facet.startswith("/u/s"):
+        value = facet.removeprefix("/u/s")
+        expr = OriginSource()
+        if value.removeprefix("/"):
+            expr.id = value.removeprefix("/")
+
+    elif facet.startswith("/n/s/"):
+        value = facet.removeprefix("/n/s/")
+        try:
+            status = ResourceProcessingStatus(value.upper())
+        except ValueError:
+            raise InvalidQueryError("filters", f"invalid resource processing status: {value}")
+        expr = Status(status=status)
+
+    else:
+        raise InvalidQueryError("filters", f"invalid filter: {facet}")
+
+    return expr
+
+
+def add_and_expression(dest: PBFilterExpression, add: PBFilterExpression):
+    dest_expr_type = dest.WhichOneof("expr")
+    if dest_expr_type is None:
+        dest.CopyFrom(add)
+    elif dest_expr_type == "bool_and":
+        dest.bool_and.operands.append(add)
+    else:
+        and_expr = PBFilterExpression()
+        and_expr.bool_and.operands.append(dest)
+        and_expr.bool_and.operands.append(add)
+        dest.CopyFrom(and_expr)

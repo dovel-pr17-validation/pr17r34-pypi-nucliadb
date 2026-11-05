@@ -1,0 +1,21 @@
+name: OSV scheduled Scan
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  push:
+    branches: [main]
+
+permissions:
+  actions: read
+  security-events: write
+  contents: read
+
+jobs:
+  scan-scheduled:
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36" # v2.7.0
+    with:
+      scan-args: |-
+        nidx/Cargo.lock
+        uv.lock
+      fail-on-vuln: false

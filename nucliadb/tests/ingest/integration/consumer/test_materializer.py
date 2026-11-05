@@ -1,0 +1,83 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+import asyncio
+
+from nucliadb.common import datamanagers
+from nucliadb.common.maindb.driver import Driver
+from nucliadb.common.nidx import NidxUtility
+from nucliadb.ingest.consumer import materializer
+from nucliadb_protos import writer_pb2
+from nucliadb_protos.kb_usage_pb2 import KbUsage, Service
+from nucliadb_utils import const
+from nucliadb_utils.audit.stream import StreamAuditStorage
+from nucliadb_utils.cache.pubsub import PubSubDriver
+from tests.ndbfixtures.ingest import create_resource
+
+
+async def test_materialize_kb_data(
+    maindb_driver: Driver,
+    pubsub: PubSubDriver,
+    storage,
+    dummy_nidx_utility: NidxUtility,
+    knowledgebox: str,
+    stream_audit: StreamAuditStorage,
+):
+    audit_storage = stream_audit
+
+    count = 10
+    for i in range(count):
+        await create_resource(
+            storage=storage,
+            driver=maindb_driver,
+            knowledgebox=knowledgebox,
+            slug=f"materializer-test-{i}",
+        )
+
+    mz = materializer.MaterializerHandler(
+        driver=maindb_driver,
+        storage=storage,
+        pubsub=pubsub,
+        check_delay=0.05,
+    )
+    await mz.initialize()
+
+    assert await datamanagers.atomic.resources.count(kbid=knowledgebox) == count
+
+    await pubsub.publish(
+        const.PubSubChannels.RESOURCE_NOTIFY.format(kbid=knowledgebox),
+        writer_pb2.Notification(
+            kbid=knowledgebox,
+            action=writer_pb2.Notification.Action.COMMIT,
+        ).SerializeToString(),
+    )
+
+    await asyncio.sleep(0.2)
+
+    assert await datamanagers.atomic.resources.count(kbid=knowledgebox) == count
+
+    await mz.finalize()
+    assert audit_storage.js.publish.call_count == 1  # type: ignore[ty:unresolved-attribute]
+    assert audit_storage.js.publish.call_args[0][0] == "kb-usage.nuclia_db"  # type: ignore[ty:unresolved-attribute]
+    pb = KbUsage()
+    pb.ParseFromString(audit_storage.js.publish.call_args[0][1])  # type: ignore[ty:unresolved-attribute]
+    assert pb.storage.resources == count
+    assert pb.service == Service.NUCLIA_DB
+    assert pb.kb_id == knowledgebox

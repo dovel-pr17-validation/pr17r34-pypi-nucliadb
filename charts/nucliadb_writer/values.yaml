@@ -1,0 +1,99 @@
+# -----
+# NucliaDB Writer Settings
+# -----
+
+# Image settings
+imagePullPolicy: IfNotPresent
+containerRegistry: CONTAINER_REGISTRY_TO_REPLACE
+image: IMAGE_TO_REPLACE
+
+# Component settings
+# ---
+# These settings are controlled through environment variables
+# all kubernetes oriented settings are controlled through
+# other values.
+# HOWEVER, we are in a transition period where we allow
+# both until all component settings are removed from
+# settings not mapped directly through env
+env: {}
+  # EXAMPLE: "VALUE"
+
+# Configmap and/or secrets to mount into the environment
+envFrom:
+  - configMapRef:
+      name: nucliadb-config #  Nucliadb-shared configMap
+  - secretRef:
+      name: nucliadb-config #  Nucliadb-shared secret
+
+# Kubernetes settings
+affinity: {}
+nodeSelector: {}
+tolerations: []
+topologySpreadConstraints: []
+podLabels: {}
+podAnnotations: {}
+revisionHistoryLimit: 2
+debug: False
+resources: {}
+#  limits:
+#    memory: "600Mi"
+#  requests:
+#    cpu: "300m"
+
+serviceAccount:
+  create: false
+  name: default
+  # labels: {}
+  # annotations: {}
+
+serving:
+  port: 8080
+  metricsPort: &metricsPort '3030'
+
+services:
+  # This must match the pg driver on nucliadb_shared
+  maindb: 5432
+  nats: 4222
+
+running:
+  sentry_url:
+
+config:
+  dm_redis_host:
+  dm_redis_port:
+
+# secret containing NATS user credentials
+## credential names inside the secret should be consistent with
+## what's configured on nucliadb_shared
+##   .Values.transaction.transaction_jetstream_auth
+##   .Values.cache.cache_pubsub_nats_auth
+nats:
+  secretName: nats-creds
+  regionalSecretName: regional-nats-creds
+
+vs:
+  gateway:
+  host:
+
+zone:
+
+serviceMonitor:
+  enabled: False
+
+tracing:
+  enabled: false
+  otlp_collector_endpoint:  # host:port of the OTLP collector, e.g. "otlp-collector-collector.observability.svc.cluster.local:4317". If blank, Jaeger is used instead.
+
+# extra_pod_annotations:
+#   key: value
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

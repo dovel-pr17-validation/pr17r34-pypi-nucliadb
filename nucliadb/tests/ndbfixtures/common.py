@@ -1,0 +1,248 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import os
+from collections.abc import AsyncIterable, AsyncIterator, Iterator
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+from pytest_mock import MockerFixture
+
+from nucliadb.common.back_pressure.materializer import (
+    get_materializer,
+    start_materializer,
+    stop_materializer,
+)
+from nucliadb.common.cluster.manager import KBShardManager
+from nucliadb.common.maindb.driver import Driver
+from nucliadb.search.predict import DummyPredictEngine
+from nucliadb_utils.audit.audit import AuditStorage
+from nucliadb_utils.audit.basic import BasicAuditStorage
+from nucliadb_utils.audit.stream import StreamAuditStorage
+from nucliadb_utils.cache.nats import NatsPubsub
+from nucliadb_utils.cache.pubsub import PubSubDriver
+from nucliadb_utils.nats import NatsConnectionManager
+from nucliadb_utils.settings import (
+    audit_settings,
+    nuclia_settings,
+    transaction_settings,
+)
+from nucliadb_utils.storages.settings import settings as storage_settings
+from nucliadb_utils.storages.storage import Storage
+from nucliadb_utils.transaction import LocalTransactionUtility, TransactionUtility
+from nucliadb_utils.utilities import (
+    Utility,
+    get_utility,
+    start_transaction_utility,
+    stop_transaction_utility,
+)
+from tests.ndbfixtures.ingest import INGEST_TESTS_DIR
+from tests.ndbfixtures.utils import application_context, global_utility
+
+# Audit
+
+
+@pytest.fixture(scope="function")
+def audit(basic_audit: BasicAuditStorage) -> Iterator[AuditStorage]:
+    yield basic_audit
+
+
+@pytest.fixture(scope="function")
+async def basic_audit() -> AsyncIterator[BasicAuditStorage]:
+    with (
+        patch.object(audit_settings, "audit_driver", "basic"),
+    ):
+        audit = BasicAuditStorage()
+        await audit.initialize()
+        with global_utility(Utility.AUDIT, audit):
+            yield audit
+        await audit.finalize()
+
+
+@pytest.fixture(scope="function")
+async def stream_audit(nats_server: str, mocker: MockerFixture) -> AsyncIterator[StreamAuditStorage]:
+    with (
+        patch.object(audit_settings, "audit_driver", "stream"),
+        patch.object(audit_settings, "audit_jetstream_servers", [nats_server]),
+    ):
+        audit = StreamAuditStorage(
+            [nats_server],
+            audit_settings.audit_jetstream_target,  # type: ignore
+            audit_settings.audit_partitions,
+            audit_settings.audit_hash_seed,
+        )
+        await audit.initialize()
+
+        mocker.spy(audit, "send")
+        mocker.spy(audit.js, "publish")
+        mocker.spy(audit, "search")
+        mocker.spy(audit, "chat")
+
+        with global_utility(Utility.AUDIT, audit):
+            yield audit
+
+        await audit.finalize()
+
+
+# Back pressure
+
+
+@pytest.fixture(scope="function")
+async def back_pressure_materializer(
+    nats_manager: NatsConnectionManager,
+):
+    from nucliadb.common.back_pressure.settings import settings
+
+    processing_client = AsyncMock()
+    processing_client.pull_status.return_value = Mock()
+    processing_client.pull_status.return_value.pending = 10
+    processing_client.stats.return_value = Mock()
+    processing_client.stats.return_value.incomplete = 10
+    with (
+        patch.object(settings, "enabled", True),
+        patch("nucliadb.common.back_pressure.utils.is_onprem_nucliadb", return_value=False),
+        patch.object(settings, "max_indexing_pending", 25),
+        patch.object(settings, "max_ingest_pending", 25),
+        patch(
+            "nucliadb.common.back_pressure.materializer.ProcessingHTTPClient",
+            return_value=processing_client,
+        ),
+    ):
+        context = application_context(
+            nats_manager=nats_manager,
+        )
+        await start_materializer(context)
+
+        materializer = get_materializer()
+        yield materializer
+
+        await stop_materializer()
+
+
+# Feature flags
+
+
+# Overwrite this fixture to disable this behavior
+@pytest.fixture(scope="function", autouse=True)
+def flipt_features_enabled():
+    evaluation = Mock()
+    evaluation.enabled = True
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "FLIPT_TOKEN": "token",
+                "FLIPT_SERVER_URL": "every-flag-is-true",
+            },
+            clear=False,
+        ),
+        patch("nucliadb_utils.featureflagging.FliptClient.evaluate_boolean", return_value=evaluation),
+    ):
+        yield
+
+
+# Local files
+
+
+@pytest.fixture(scope="function")
+def local_files():
+    """Configure NucliaDB with a specific path for the local storage. This is
+    required for tests operating with local storage, so it knows where do we
+    expect the files to be and can access them.
+
+    """
+    with patch.object(storage_settings, "local_testing_files", INGEST_TESTS_DIR):
+        yield
+
+
+# Predict
+
+
+@pytest.fixture(scope="function")
+def predict_mock() -> Mock:  # type: ignore
+    mock = AsyncMock()
+
+    with global_utility(Utility.PREDICT, mock):
+        yield mock
+
+
+@pytest.fixture(scope="function")
+async def dummy_predict() -> AsyncIterable[DummyPredictEngine]:
+    with (
+        patch.object(nuclia_settings, "dummy_predict", True),
+    ):
+        predict_util = DummyPredictEngine()
+        await predict_util.initialize()
+
+        with global_utility(Utility.PREDICT, predict_util):
+            yield predict_util
+
+
+# PubSub
+
+
+@pytest.fixture(scope="function")
+async def pubsub(nats_server: str) -> AsyncIterator[PubSubDriver]:
+    assert get_utility(Utility.PUBSUB) is None, "No pubsub is expected to be already set"
+
+    pubsub = NatsPubsub(hosts=[nats_server])
+    await pubsub.initialize()
+    with global_utility(Utility.PUBSUB, pubsub):
+        yield pubsub
+    await pubsub.finalize()
+
+
+# Shard manager
+
+
+@pytest.fixture(scope="function")
+async def shard_manager(storage: Storage, maindb_driver: Driver) -> AsyncIterator[KBShardManager]:
+    sm = KBShardManager()
+    with global_utility(Utility.SHARD_MANAGER, sm):
+        yield sm
+
+
+# Transaction
+
+
+@pytest.fixture(scope="function")
+async def transaction_utility(
+    nats_transaction_utility: TransactionUtility,
+) -> AsyncIterator[TransactionUtility]:
+    yield nats_transaction_utility
+
+
+@pytest.fixture(scope="function")
+async def local_transaction_utility() -> AsyncIterator[LocalTransactionUtility]:
+    with patch.object(transaction_settings, "transaction_local", True):
+        util = await start_transaction_utility()
+        assert isinstance(util, LocalTransactionUtility)
+        yield util
+        await stop_transaction_utility()
+
+
+@pytest.fixture(scope="function")
+async def nats_transaction_utility(
+    nats_server: str, pubsub: PubSubDriver
+) -> AsyncIterator[TransactionUtility]:
+    with patch.object(transaction_settings, "transaction_jetstream_servers", [nats_server]):
+        util = await start_transaction_utility()
+        assert isinstance(util, TransactionUtility)
+        yield util
+        await stop_transaction_utility()

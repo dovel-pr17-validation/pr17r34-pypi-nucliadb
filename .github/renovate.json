@@ -1,0 +1,66 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": [
+        "config:recommended",
+        ":dependencyDashboard"
+    ],
+    "rebaseWhen": "never",
+    "assignees": [
+        "lferran",
+        "jotare",
+        "rastut"
+    ],
+    "pip_setup": {
+        "enabled": false
+    },
+    "pip_requirements": {
+        "enabled": false
+    },
+    "pipenv": {
+        "enabled": false
+    },
+    "poetry": {
+        "enabled": false
+    },
+    "pep621": {
+        "enabled": false
+    },
+    "cargo": {
+        "enabled": false
+    },
+    "ignorePaths": [
+        "charts/**",
+        "docs/**",
+        "e2e/**",
+        "nidx/**",
+        "nucliadb/**",
+        "nucliadb_dataset/**",
+        "nucliadb_models/**",
+        "nucliadb_protos/**",
+        "nucliadb_sdk/**",
+        "nucliadb_telemetry/**",
+        "nucliadb_utils/**",
+        "proposals/**",
+        "scripts/**",
+        ".github/workflows/polaris.yaml"
+    ],
+    "packageRules": [
+        {
+            "matchManagers": ["github-actions"],
+            "matchDepNames": ["python"],
+            "separateMultipleMinor": true
+        },
+        {
+            "matchManagers": ["github-actions"],
+            "matchDepNames": ["python"],
+            "matchCurrentVersion": "<3.12",
+            "allowedVersions": "<3.12"
+        },
+        {
+            "matchDepTypes": [
+                "action"
+            ],
+            "pinDigests": true
+        }
+    ]
+}

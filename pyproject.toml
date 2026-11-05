@@ -1,0 +1,67 @@
+[project]
+name = "nucliadb_workspace"
+requires-python = ">=3.11, <4"
+version = "7.2.0"
+dependencies = ["nucliadb"]
+
+[tool.uv.workspace]
+members = [
+    "nidx/nidx_binding",
+    "nidx/nidx_protos",
+    "nucliadb_dataset",
+    "nucliadb_models",
+    "nucliadb_protos",
+    "nucliadb_sdk",
+    "nucliadb_telemetry",
+    "nucliadb_utils",
+    "nucliadb",
+]
+
+[tool.uv]
+default-groups = "all"
+managed = true
+
+[tool.uv.sources]
+nidx-binding = { workspace = true }
+nidx-protos = { workspace = true }
+nucliadb = { workspace = true }
+nucliadb-dataset = { workspace = true }
+nucliadb-models = { workspace = true }
+nucliadb-protos = { workspace = true }
+nucliadb-sdk = { workspace = true }
+nucliadb-telemetry = { workspace = true }
+nucliadb-utils = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # Linting
+    "mypy-protobuf>=3.6.0",
+    "mypy",
+    "pre-commit",
+    "ruff",
+    # Testing
+    "faker>=25.1.0",
+    "jsonschema",
+    "pdbpp>=0.10.3",
+    "pytest-asyncio>=0.23.0",
+    "pytest-benchmark",
+    "pytest-cov",
+    "pytest-docker-fixtures[pg]>=1.4.2",
+    "pytest-lazy-fixtures",
+    "pytest-mock",
+    "pytest-rerunfailures>=11.1.2",
+    "pytest-shard",
+    "pytest-xdist>=3.6.1",
+    "pytest>=8.2.2",
+    "requests",
+    "requests-mock>=1.12.1",
+    "types-PyYAML>=6.0.12.20240808",
+    "ty>=0.0.34",
+]
+nidx = [
+  "nidx-binding"
+]
+sdk = [
+    "nucliadb_sdk",
+    "nucliadb_dataset"
+]

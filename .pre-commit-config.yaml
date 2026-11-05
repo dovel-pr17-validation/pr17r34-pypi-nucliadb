@@ -1,0 +1,66 @@
+repos:
+  - repo: local
+    hooks:
+      - id: lint_nucliadb
+        name: Lint nucliadb
+        entry: make -C nucliadb lint
+        language: system
+        files: (^nucliadb/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: lint_nucliadb_dataset
+        name: Lint nucliadb_dataset
+        entry: make -C nucliadb_dataset lint
+        language: system
+        files: (^nucliadb_dataset/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: lint_nucliadb_models
+        name: Lint nucliadb_models
+        entry: make -C nucliadb_models lint
+        language: system
+        files: (^nucliadb_models/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: lint_nucliadb_sdk
+        name: Lint nucliadb_sdk
+        entry: make -C nucliadb_sdk lint
+        language: system
+        files: (^nucliadb_sdk/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: lint_nucliadb_telemetry
+        name: Lint nucliadb_telemetry
+        entry: make -C nucliadb_telemetry lint
+        language: system
+        files: (^nucliadb_telemetry/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: lint_nucliadb_utils
+        name: Lint nucliadb_utils
+        entry: make -C nucliadb_utils lint
+        language: system
+        files: (^nucliadb_utils/)
+        types: ["python"]
+        pass_filenames: false
+
+      - id: rustfmt_nidx
+        name: Rust format check for nidx
+        entry: cargo fmt --check --all --manifest-path nidx/Cargo.toml
+        language: system
+        files: (^nidx/)
+        types: ["rust"]
+        pass_filenames: false
+
+      - id: clippy_nidx
+        name: Clippy warning check for nidx
+        entry: cargo clippy --all-features --manifest-path nidx/Cargo.toml -- -D warnings
+        language: system
+        files: (^nidx/)
+        types: ["rust"]
+        pass_filenames: false

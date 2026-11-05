@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+  labels:
+    app: writer
+    version: "{{ .Chart.Version | replace "+" "_" }}"
+    chart: "{{ .Chart.Name }}"
+    release: "{{ .Release.Name }}"
+    heritage: "{{ .Release.Service }}"
+spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      app: writer
+      release: "{{ .Release.Name }}"
+      heritage: "{{ .Release.Service }}"
+  template:
+    metadata:
+      name: writer
+      labels:
+        app: writer
+        version: "{{ .Chart.Version | replace "+" "_" }}"
+        chart: "{{ .Chart.Name }}"
+        release: "{{ .Release.Name }}"
+        heritage: "{{ .Release.Service }}"
+        {{- with .Values.podLabels -}}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # do not have access to dependency chart cm this component references
+        checksum/cm: {{ include (print $.Template.BasePath "/writer.cm.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations -}}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | indent 8 }}
+      topologySpreadConstraints:
+{{ toYaml .Values.topologySpreadConstraints | indent 8 }}
+      affinity:
+{{ toYaml .Values.affinity | indent 8 }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 8 }}
+      dnsPolicy: ClusterFirst
+{{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+{{- end }}
+      serviceAccountName: {{ if kindIs "string" .Values.serviceAccount }}{{ .Values.serviceAccount }}{{ else }}{{ .Values.serviceAccount.name | default "default" }}{{ end }}
+      containers:
+      - name: writer
+        image: "{{ .Values.containerRegistry }}/{{ .Values.image }}"
+        securityContext:
+          privileged: false
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /
+            port: {{ .Values.serving.port }}
+          initialDelaySeconds: 20
+          timeoutSeconds: 10
+          periodSeconds: 20
+        readinessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /
+            port: {{ .Values.serving.port }}
+          initialDelaySeconds: 2
+          timeoutSeconds: 10
+          periodSeconds: 10
+        command: [
+          "nucliadb-writer"
+        ]
+        lifecycle:
+          preStop:
+            exec:
+              # in order to avoid latent load balancer routing/update issues, arbitrarily throw
+              # some delay in the shutdown process
+              command: ["sleep", "15"]
+        envFrom:
+          - configMapRef:
+              name: writer-config
+          - secretRef:
+              name: writer-config
+          {{- if .Values.envFrom }}
+          {{- toYaml .Values.envFrom | nindent 10 }}
+          {{- end }}
+        env:
+          - name: VERSION
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['version']
+          {{- include "toEnv" .Values.env | indent 10 }}
+        ports:
+        - name: http-writer
+          containerPort: {{ .Values.serving.port }}
+        - name: metrics
+          containerPort: {{ .Values.serving.metricsPort }}
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+{{- if .Values.nats.secretName }}
+        volumeMounts:
+          - name: nats-creds
+            readOnly: true
+            mountPath: /appsecrets
+{{- end }}
+{{- if .Values.nats.regionalSecretName }}
+          - name: regional-nats-creds
+            readOnly: true
+            mountPath: /regioncreds
+{{- end }}
+{{- if .Values.nats.secretName }}
+      volumes:
+      - name: nats-creds
+        secret:
+          secretName: {{ .Values.nats.secretName }}
+{{- end }}
+{{- if .Values.nats.regionalSecretName }}
+      - name: regional-nats-creds
+        secret:
+          secretName: {{ .Values.nats.regionalSecretName }}
+{{- end }}

@@ -1,0 +1,810 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+import dataclasses
+from datetime import datetime
+
+from fastapi import HTTPException
+from google.protobuf.json_format import MessageToDict
+
+import nucliadb_models as models
+from nucliadb.common import datamanagers
+from nucliadb.common.maindb.driver import Transaction
+from nucliadb.common.models_utils import from_proto, to_proto
+from nucliadb.ingest.fields.conversation import MAX_CONVERSATION_MESSAGES, Conversation
+from nucliadb.ingest.fields.key_value import validate_kv_data
+from nucliadb.ingest.orm.knowledgebox import KnowledgeBox
+from nucliadb.ingest.orm.resource import Resource as ORMResource
+from nucliadb.ingest.processing import ProcessingEngine
+from nucliadb.models.internal import processing as processing_models
+from nucliadb.models.internal.processing import (
+    ClassificationLabel,
+    PushConversation,
+    PushGeneratedConversation,
+    PushPayload,
+)
+from nucliadb.writer import SERVICE_NAME, logger
+from nucliadb.writer.utilities import get_processing
+from nucliadb_models.common import FieldTypeName
+from nucliadb_models.content_types import GENERIC_MIME_TYPE
+from nucliadb_models.writer import (
+    CreateResourcePayload,
+    KeyValueField,
+    UpdateResourcePayload,
+)
+from nucliadb_protos import resources_pb2
+from nucliadb_protos.writer_pb2 import BrokerMessage, FieldIDStatus, FieldStatus
+from nucliadb_utils.storages.storage import Storage, StorageField
+from nucliadb_utils.utilities import get_storage
+
+
+@dataclasses.dataclass
+class ResourceClassifications:
+    resource_level: set[ClassificationLabel] = dataclasses.field(default_factory=set)
+    field_level: dict[tuple[resources_pb2.FieldType.ValueType, str], set[ClassificationLabel]] = (
+        dataclasses.field(default_factory=dict)
+    )
+
+    def for_field(
+        self, field_key: str, field_type: resources_pb2.FieldType.ValueType
+    ) -> list[ClassificationLabel]:
+        """
+        Returns a list of unique classification labels for a given field, including those inherited from the resource.
+        """
+        field_id = (field_type, field_key)
+        resource_level = self.resource_level
+        field_level = self.field_level.get(field_id, set())
+        return list(resource_level.union(field_level))
+
+
+REPROCESSABLE_FIELD_TYPES = {
+    resources_pb2.FieldType.TEXT,
+    resources_pb2.FieldType.FILE,
+    resources_pb2.FieldType.CONVERSATION,
+    resources_pb2.FieldType.LINK,
+}
+
+
+async def _to_push_filefield(
+    processing: ProcessingEngine,
+    storage: Storage,
+    field_pb: resources_pb2.FieldFile,
+    classif_labels: list[ClassificationLabel],
+) -> str:
+    if field_pb.file.source == resources_pb2.CloudFile.Source.EXTERNAL:
+        file_field = models.FileField(
+            language=field_pb.language,
+            password=field_pb.password,
+            file=models.File(payload=None, uri=field_pb.file.uri),
+            extract_strategy=field_pb.extract_strategy,
+            split_strategy=field_pb.split_strategy,
+        )
+        return processing.convert_external_filefield_to_str(file_field, classif_labels)
+    else:
+        return await processing.convert_internal_filefield_to_str(field_pb, storage, classif_labels)
+
+
+async def extract_file_field(
+    field_id: str,
+    resource: ORMResource,
+    toprocess: PushPayload,
+    resource_classifications: ResourceClassifications,
+    password: str | None = None,
+):
+    field_type = resources_pb2.FieldType.FILE
+    field = await resource.get_field(field_id, field_type, load=False)
+    field_pb = await field.get_value()
+    if field_pb is None:
+        raise KeyError(f"Field {field_id} does not exists")
+
+    if password is not None:
+        field_pb.password = password
+    processing = get_processing()
+    storage = await get_storage(service_name=SERVICE_NAME)
+    classif_labels = resource_classifications.for_field(field_id, resources_pb2.FieldType.FILE)
+    toprocess.filefield[field_id] = await _to_push_filefield(
+        processing, storage, field_pb, classif_labels
+    )
+
+
+async def collect_fields_for_reprocessing(
+    resource: ORMResource,
+    toprocess: PushPayload,
+    selected_fields: set[tuple[int, str]] | None = None,
+    file_password_overrides: dict[str, str] | None = None,
+) -> list[tuple[int, str]]:
+    processing = get_processing()
+    storage = await get_storage(service_name=SERVICE_NAME)
+    await resource.get_fields()
+
+    resource_classifications = await atomic_get_stored_resource_classifications(
+        kbid=toprocess.kbid,
+        rid=toprocess.uuid,
+    )
+    extracted_fields: list[tuple[int, str]] = []
+    for (field_type, field_id), field in resource.fields.items():
+        if selected_fields is not None and (field_type, field_id) not in selected_fields:
+            continue
+
+        field_type_name = from_proto.field_type_name(field_type)
+
+        if field_type not in REPROCESSABLE_FIELD_TYPES:
+            continue
+
+        field_pb = await field.get_value()
+        if field_pb is None and field_type_name != FieldTypeName.CONVERSATION:
+            logger.warning(
+                f"Field no longer exists or it does not have a value",
+                extra={
+                    "kbid": toprocess.kbid,
+                    "rid": toprocess.uuid,
+                    "field_id": field_id,
+                    "field_type": field_type_name.name,
+                },
+            )
+            continue
+        classif_labels = resource_classifications.for_field(field_id, field_type)
+        if field_type_name is FieldTypeName.FILE:
+            if file_password_overrides and field_id in file_password_overrides:
+                field_pb.password = file_password_overrides[field_id]
+            toprocess.filefield[field_id] = await _to_push_filefield(
+                processing, storage, field_pb, classif_labels
+            )
+            extracted_fields.append((field_type, field_id))
+
+        if field_type_name is FieldTypeName.LINK:
+            toprocess.linkfield[field_id] = _to_push_linkfield(field_pb, classif_labels)
+            extracted_fields.append((field_type, field_id))
+
+        if field_type_name is FieldTypeName.TEXT:
+            toprocess.textfield[field_id] = _to_push_textfield(field_pb, classif_labels)
+            extracted_fields.append((field_type, field_id))
+
+        if field_type_name is FieldTypeName.CONVERSATION and isinstance(field, Conversation):
+            full_conversation = await _to_push_conversationfield(
+                processing, storage, field, classif_labels
+            )
+            if full_conversation is None:
+                continue
+            toprocess.conversationfield[field_id] = full_conversation
+            extracted_fields.append((field_type, field_id))
+
+    return extracted_fields
+
+
+def _to_push_linkfield(
+    field_pb: resources_pb2.FieldLink, classif_labels: list[ClassificationLabel]
+) -> processing_models.LinkUpload:
+    parsed_link = MessageToDict(
+        field_pb,
+        preserving_proto_field_name=True,
+        always_print_fields_with_no_presence=True,
+    )
+    parsed_link["link"] = parsed_link.pop("uri", None)
+    return processing_models.LinkUpload(**parsed_link, classification_labels=classif_labels)
+
+
+def _to_push_textfield(
+    field_pb: resources_pb2.FieldText, classif_labels: list[ClassificationLabel]
+) -> processing_models.Text:
+    parsed_text = MessageToDict(
+        field_pb,
+        preserving_proto_field_name=True,
+        always_print_fields_with_no_presence=True,
+    )
+    parsed_text["format"] = processing_models.PushTextFormat[parsed_text["format"]]
+    return processing_models.Text(**parsed_text, classification_labels=classif_labels)
+
+
+async def _to_push_conversationfield(
+    processing: ProcessingEngine,
+    storage: Storage,
+    field: Conversation,
+    classification_labels: list[ClassificationLabel],
+) -> PushConversation | None:
+    """
+    Converts a Conversation field into a PushConversation model, which includes all messages and attachments, ready to be sent to the processing engine.
+    Returns None if the conversation has no messages.
+    """
+    metadata = await field.get_metadata()
+    if metadata is None or metadata.pages == 0:
+        return None
+
+    full_conversation = PushConversation(
+        messages=[],
+        extract_strategy=metadata.extract_strategy,
+        split_strategy=metadata.split_strategy,
+        classification_labels=classification_labels,
+    )
+    for page in range(0, metadata.pages):
+        conversation_pb = await field.get_value(page + 1)
+        if conversation_pb is None:
+            continue
+        for message in conversation_pb.messages:
+            if message.content.text == "":
+                # Do not include empty or deleted messages
+                continue
+            full_conversation.messages.append(await _to_push_message(message, processing, storage))
+    if len(full_conversation.messages) == 0:
+        return None
+    return full_conversation
+
+
+async def parse_fields(
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    item: CreateResourcePayload | UpdateResourcePayload,
+    kbid: str,
+    uuid: str,
+    x_skip_store: bool,
+    resource_classifications: ResourceClassifications,
+):
+    for key, file_field in item.files.items():
+        await parse_file_field(
+            key,
+            file_field,
+            writer,
+            toprocess,
+            kbid,
+            uuid,
+            resource_classifications,
+            skip_store=x_skip_store,
+        )
+
+    for key, link_field in item.links.items():
+        parse_link_field(
+            key,
+            link_field,
+            writer,
+            toprocess,
+            resource_classifications,
+        )
+
+    for key, text_field in item.texts.items():
+        parse_text_field(
+            key,
+            text_field,
+            writer,
+            toprocess,
+            resource_classifications,
+        )
+
+    for key, conversation_field in item.conversations.items():
+        await parse_conversation_field(
+            key,
+            conversation_field,
+            writer,
+            toprocess,
+            kbid,
+            uuid,
+            resource_classifications,
+            replace_field=True,
+        )
+
+    for key, kv_field in item.key_values.items():
+        await parse_key_value_field(
+            key,
+            kv_field,
+            writer,
+            kbid=kbid,
+        )
+
+
+async def parse_key_value_field(
+    key: str,
+    kv_field: KeyValueField,
+    writer: BrokerMessage,
+    *,
+    kbid: str,
+    txn: Transaction | None = None,
+) -> None:
+    """
+    Validate and populate writer.key_value_fields[key] from a KeyValueField API model.
+
+    Validation against the KB schema happens here (writer side) so we can return
+    a 422 to the HTTP client before the BrokerMessage is committed.
+    The entire data dict is JSON-encoded into the proto's single string data field.
+    No NLP processing is needed for KV fields.
+    """
+
+    # Fetch schema and validate before touching the BrokerMessage
+    if txn is not None:
+        schema = await datamanagers.kv_schemas.get(txn, kbid=kbid, id=key)
+    else:
+        async with datamanagers.with_ro_transaction() as ro_txn:
+            schema = await datamanagers.kv_schemas.get(ro_txn, kbid=kbid, id=key)
+
+    if schema is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"KV schema '{key}' does not exist in this knowledge box",
+        )
+
+    try:
+        validate_kv_data(kv_field.data, schema)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    pb = writer.key_value_fields[key]
+    pb.schema_id = key
+    pb.data = kv_field.serialize_json_for_proto()
+
+    writer.field_statuses.append(
+        FieldIDStatus(
+            id=resources_pb2.FieldID(field_type=resources_pb2.FieldType.KEY_VALUE, field=key),
+            status=FieldStatus.Status.PROCESSED,
+        )
+    )
+
+
+def parse_text_field(
+    key: str,
+    text_field: models.TextField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    resource_classifications: ResourceClassifications,
+) -> None:
+    classif_labels = resource_classifications.for_field(key, resources_pb2.FieldType.TEXT)
+    if text_field.extract_strategy is not None:
+        writer.texts[key].extract_strategy = text_field.extract_strategy
+    if text_field.split_strategy is not None:
+        writer.texts[key].split_strategy = text_field.split_strategy
+    writer.texts[key].body = text_field.body
+    writer.texts[key].format = resources_pb2.FieldText.Format.Value(text_field.format.value)
+    etw = resources_pb2.ExtractedTextWrapper()
+    etw.field.field = key
+    etw.field.field_type = resources_pb2.FieldType.TEXT
+    etw.body.text = text_field.body
+    writer.extracted_text.append(etw)
+    toprocess.textfield[key] = processing_models.Text(
+        body=text_field.body,
+        format=getattr(processing_models.PushTextFormat, text_field.format.value),
+        extract_strategy=text_field.extract_strategy,
+        split_strategy=text_field.split_strategy,
+        classification_labels=classif_labels,
+    )
+    writer.field_statuses.append(
+        FieldIDStatus(
+            id=resources_pb2.FieldID(field_type=resources_pb2.FieldType.TEXT, field=key),
+            status=FieldStatus.Status.PENDING,
+        )
+    )
+
+
+async def parse_file_field(
+    key: str,
+    file_field: models.FileField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    kbid: str,
+    uuid: str,
+    resource_classifications: ResourceClassifications,
+    skip_store: bool = False,
+):
+    if file_field.file.is_external:
+        parse_external_file_field(key, file_field, writer, toprocess, resource_classifications)
+    else:
+        await parse_internal_file_field(
+            key,
+            file_field,
+            writer,
+            toprocess,
+            kbid,
+            uuid,
+            resource_classifications,
+            skip_store=skip_store,
+        )
+
+    writer.field_statuses.append(
+        FieldIDStatus(
+            id=resources_pb2.FieldID(field_type=resources_pb2.FieldType.FILE, field=key),
+            status=FieldStatus.Status.PENDING,
+        )
+    )
+
+
+async def parse_internal_file_field(
+    key: str,
+    file_field: models.FileField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    kbid: str,
+    uuid: str,
+    resource_classifications: ResourceClassifications,
+    skip_store: bool = False,
+) -> None:
+    classif_labels = resource_classifications.for_field(key, resources_pb2.FieldType.FILE)
+    writer.files[key].added.FromDatetime(datetime.now())
+    if file_field.language:
+        writer.files[key].language = file_field.language
+    if file_field.extract_strategy is not None:
+        writer.files[key].extract_strategy = file_field.extract_strategy
+    if file_field.split_strategy is not None:
+        writer.files[key].split_strategy = file_field.split_strategy
+
+    processing = get_processing()
+    if skip_store:
+        # Does not store file on nuclia's blob storage. Only sends it to process
+        toprocess.filefield[key] = await processing.convert_filefield_to_str(file_field, classif_labels)
+
+    else:
+        # Store file on nuclia's blob storage
+        storage = await get_storage(service_name=SERVICE_NAME)
+        sf: StorageField = storage.file_field(kbid, uuid, field=key)
+        writer.files[key].file.CopyFrom(
+            await storage.upload_b64file_to_cloudfile(
+                sf,
+                file_field.file.payload.encode(),  # type: ignore
+                file_field.file.filename,  # type: ignore
+                file_field.file.content_type,
+                file_field.file.md5,
+            )
+        )
+        # Send the pointer of the new blob to processing
+        toprocess.filefield[key] = await processing.convert_internal_filefield_to_str(
+            writer.files[key], storage, classif_labels
+        )
+
+
+def parse_external_file_field(
+    key: str,
+    file_field: models.FileField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    resource_classifications: ResourceClassifications,
+) -> None:
+    classif_labels = resource_classifications.for_field(key, resources_pb2.FieldType.FILE)
+    writer.files[key].added.FromDatetime(datetime.now())
+    if file_field.language:
+        writer.files[key].language = file_field.language
+    if file_field.extract_strategy is not None:
+        writer.files[key].extract_strategy = file_field.extract_strategy
+    if file_field.split_strategy is not None:
+        writer.files[key].split_strategy = file_field.split_strategy
+    uri = file_field.file.uri
+    writer.files[key].url = uri  # type: ignore
+    writer.files[key].file.uri = uri  # type: ignore
+    writer.files[key].file.source = resources_pb2.CloudFile.Source.EXTERNAL
+    writer.files[key].file.content_type = file_field.file.content_type
+    if file_field.file.content_type and writer.basic.icon == GENERIC_MIME_TYPE:
+        writer.basic.icon = file_field.file.content_type
+    processing = get_processing()
+    toprocess.filefield[key] = processing.convert_external_filefield_to_str(file_field, classif_labels)
+
+
+def parse_link_field(
+    key: str,
+    link_field: models.LinkField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    resource_classifications: ResourceClassifications,
+) -> None:
+    classif_labels = resource_classifications.for_field(key, resources_pb2.FieldType.LINK)
+    writer.links[key].added.FromDatetime(datetime.now())
+
+    writer.links[key].uri = link_field.uri
+    if link_field.language:
+        writer.links[key].language = link_field.language
+
+    if link_field.headers is not None:
+        for header, value in link_field.headers.items():
+            writer.links[key].headers[header] = value
+
+    if link_field.cookies is not None:
+        for cookie, value in link_field.cookies.items():
+            writer.links[key].headers[cookie] = value
+
+    if link_field.localstorage is not None:
+        for local, value in link_field.localstorage.items():
+            writer.links[key].localstorage[local] = value
+
+    if link_field.css_selector is not None:
+        writer.links[key].css_selector = link_field.css_selector
+
+    if link_field.xpath is not None:
+        writer.links[key].xpath = link_field.xpath
+
+    if link_field.extract_strategy is not None:
+        writer.links[key].extract_strategy = link_field.extract_strategy
+
+    if link_field.split_strategy is not None:
+        writer.links[key].split_strategy = link_field.split_strategy
+
+    toprocess.linkfield[key] = processing_models.LinkUpload(
+        link=link_field.uri,
+        headers=link_field.headers or {},
+        cookies=link_field.cookies or {},
+        localstorage=link_field.localstorage or {},
+        css_selector=link_field.css_selector,
+        xpath=link_field.xpath,
+        extract_strategy=link_field.extract_strategy,
+        split_strategy=link_field.split_strategy,
+        classification_labels=classif_labels,
+    )
+    writer.field_statuses.append(
+        FieldIDStatus(
+            id=resources_pb2.FieldID(field_type=resources_pb2.FieldType.LINK, field=key),
+            status=FieldStatus.Status.PENDING,
+        )
+    )
+
+
+async def parse_conversation_field(
+    key: str,
+    conversation_field: models.InputConversationField,
+    writer: BrokerMessage,
+    toprocess: PushPayload,
+    kbid: str,
+    uuid: str,
+    resource_classifications: ResourceClassifications,
+    replace_field: bool,
+) -> None:
+    if not replace_field:
+        # Appending messages to conversation
+        await _conversation_append_checks(kbid, uuid, key, conversation_field)
+    classif_labels = resource_classifications.for_field(key, resources_pb2.FieldType.CONVERSATION)
+    storage = await get_storage(service_name=SERVICE_NAME)
+    processing = get_processing()
+    field_value = resources_pb2.Conversation(replace_field=replace_field)
+    convs = processing_models.PushConversation()
+    for message in conversation_field.messages:
+        # Message content
+        processing_message = processing_models.PushMessage(
+            timestamp=message.timestamp,
+            content=processing_models.PushMessageContent(
+                text=message.content.text,
+                format=_to_push_message_format(message.content.format),
+            ),
+            ident=message.ident,
+        )
+        cm = resources_pb2.Message()
+        cm.content.text = message.content.text
+        cm.content.format = to_proto.conversation_message_format(message.content.format)
+
+        # Message metadata
+        if message.timestamp:
+            cm.timestamp.FromDatetime(message.timestamp)
+        if message.who:
+            cm.who = message.who
+            processing_message.who = message.who
+        for to in message.to:
+            cm.to.append(to)
+            processing_message.to.append(to)
+        cm.ident = message.ident
+        if message.type_ is not None:
+            cm.type = resources_pb2.Message.MessageType.Value(message.type_.value)
+
+        # Message content attachments
+        cm.content.attachments_fields.extend(
+            [
+                resources_pb2.FieldRef(
+                    field_type=to_proto.field_type_name(attachment.field_type),
+                    field_id=attachment.field_id,
+                    split=attachment.split if attachment.split is not None else "",
+                )
+                for attachment in message.content.attachments_fields
+            ]
+        )
+        for idx, file in enumerate(message.content.attachments):
+            sf_conv_field: StorageField = storage.conversation_field_attachment(
+                kbid, uuid, field=key, ident=message.ident, attachment_index=idx
+            )
+            cf_conv_field = await storage.upload_b64file_to_cloudfile(
+                sf_conv_field,
+                file.payload.encode(),
+                file.filename,
+                file.content_type,
+                file.md5,
+            )
+            cm.content.attachments.append(cf_conv_field)
+
+            processing_message.content.attachments.append(
+                await processing.convert_internal_cf_to_str(cf_conv_field, storage)
+            )
+
+        # Append message to conversation
+        convs.messages.append(processing_message)
+        field_value.messages.append(cm)
+
+    # Processing options and classification labels
+    convs.classification_labels = classif_labels
+    if conversation_field.extract_strategy:
+        field_value.extract_strategy = conversation_field.extract_strategy
+        convs.extract_strategy = conversation_field.extract_strategy
+    if conversation_field.split_strategy:
+        field_value.split_strategy = conversation_field.split_strategy
+        convs.split_strategy = conversation_field.split_strategy
+
+    # Set the conversation field value in the proto and the processing models
+    toprocess.conversationfield[key] = convs
+
+    if not replace_field:
+        # When appending new messages to a conversation, add the generated conversations to push payload too.
+        await add_generated_conversations_to_pushpayload(processing, storage, kbid, uuid, key, toprocess)
+
+    writer.conversations[key].CopyFrom(field_value)
+    writer.field_statuses.append(
+        FieldIDStatus(
+            id=resources_pb2.FieldID(field_type=resources_pb2.FieldType.CONVERSATION, field=key),
+            status=FieldStatus.Status.PENDING,
+        )
+    )
+
+
+async def add_generated_conversations_to_pushpayload(
+    processing: ProcessingEngine,
+    storage: Storage,
+    kbid: str,
+    resource_id: str,
+    source_field_id: str,
+    toprocess: PushPayload,
+) -> None:
+    """
+    For each conversation field (source_field_id), add the corresponding generated conversation fields to the push payload,
+    so they can be sent to processing to generate new messages upon new messages being appended to the original conversation.
+    """
+    all_field_ids = await datamanagers.atomic.resources.get_all_field_ids(kbid=kbid, rid=resource_id)
+    if all_field_ids is None:
+        return
+    generated_fields = [
+        field_id.field
+        for field_id in all_field_ids.fields
+        if is_generated_conversation_field(field_id.field_type, field_id.field)
+        and field_id.field != source_field_id
+        and source_field_id in field_id.field
+    ]
+    if len(generated_fields) == 0:
+        return
+
+    resource = await _get_resource(kbid, resource_id, storage)
+    if resource is None:
+        return
+
+    for generated_field_id in generated_fields:
+        gfield = await resource.get_field(
+            generated_field_id, resources_pb2.FieldType.CONVERSATION, load=False
+        )
+        gconversation = await _to_push_conversationfield(processing, storage, gfield, [])
+        if gconversation is None:
+            continue
+        toprocess.generated_conversationfield[generated_field_id] = PushGeneratedConversation(
+            source_field_id=source_field_id,
+            conversationfield=gconversation,
+        )
+
+
+def is_generated_conversation_field(
+    field_type: resources_pb2.FieldType.ValueType, field_id: str
+) -> bool:
+    return field_type == resources_pb2.FieldType.CONVERSATION and field_id.startswith("da-")
+
+
+async def _get_resource(kbid: str, rid: str, storage: Storage) -> ORMResource | None:
+    async with datamanagers.with_ro_transaction() as txn:
+        kb = KnowledgeBox(txn, storage, kbid)
+        return await kb.get(rid)
+
+
+async def atomic_get_stored_resource_classifications(
+    kbid: str,
+    rid: str,
+) -> ResourceClassifications:
+    async with datamanagers.with_ro_transaction() as txn:
+        return await get_stored_resource_classifications(txn, kbid=kbid, rid=rid)
+
+
+async def get_stored_resource_classifications(
+    txn: Transaction,
+    *,
+    kbid: str,
+    rid: str,
+) -> ResourceClassifications:
+    rc = ResourceClassifications()
+    basic = await datamanagers.resources.get_basic(txn, kbid=kbid, rid=rid)
+    if basic is None:
+        # Resource not found
+        return rc
+
+    # User resource-level classifications
+    for u_classif in basic.usermetadata.classifications:
+        classif = ClassificationLabel(labelset=u_classif.labelset, label=u_classif.label)
+        rc.resource_level.add(classif)
+
+    # Processor-computed field-level classifications. These are not user-defined and are immutable.
+    for field_classif in basic.computedmetadata.field_classifications:
+        fid = (field_classif.field.field_type, field_classif.field.field)
+        for f_classif in field_classif.classifications:
+            classif = ClassificationLabel(labelset=f_classif.labelset, label=f_classif.label)
+            rc.field_level.setdefault(fid, set()).add(classif)
+    return rc
+
+
+async def _conversation_append_checks(
+    kbid: str, rid: str, field_id: str, input: models.InputConversationField
+):
+    async with datamanagers.with_ro_transaction() as txn:
+        resource_obj = await ORMResource.get(txn, kbid=kbid, rid=rid)
+        if resource_obj is None:
+            return
+        conv: Conversation = await resource_obj.get_field(
+            field_id, resources_pb2.FieldType.CONVERSATION, load=False
+        )
+
+        # Make sure that the max number of messages is not exceeded
+        cmetadata = await conv.get_metadata()
+        if cmetadata is None:
+            current_message_count = 0
+        else:
+            current_message_count = cmetadata.total
+        if (
+            MAX_CONVERSATION_MESSAGES is not None
+            and (len(input.messages) + current_message_count) > MAX_CONVERSATION_MESSAGES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Conversation fields cannot have more than {MAX_CONVERSATION_MESSAGES} messages.",
+            )
+
+        # Make sure input messages use unique idents
+        existing_message_ids = set((await conv.get_splits_metadata()).metadata.keys())
+        input_message_ids = {message.ident for message in input.messages}
+        intersection = input_message_ids.intersection(existing_message_ids)
+        if intersection != set():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Message identifiers must be unique field={field_id}: {list(intersection)[:50]}",
+            )
+
+
+def _to_push_message_format(
+    format: models.MessageFormat | resources_pb2.MessageContent.Format.ValueType,
+) -> processing_models.PushMessageFormat:
+    """
+    The pb, ndb model, and processing model enums are not in sync, so we need this to avoid errors.
+    """
+    if isinstance(format, models.MessageFormat):
+        return getattr(processing_models.PushMessageFormat, format.value)
+    else:
+        # The int values in the protobuffer are swapped between JSON and KEEP_MARKDOWN compared to the processing models,
+        # so we need to handle them separately.
+        if format == resources_pb2.MessageContent.Format.JSON:
+            return processing_models.PushMessageFormat.JSON
+        elif format == resources_pb2.MessageContent.Format.KEEP_MARKDOWN:
+            return processing_models.PushMessageFormat.KEEP_MARKDOWN
+        else:
+            return processing_models.PushMessageFormat(format)
+
+
+async def _to_push_message(
+    message_pb: resources_pb2.Message, processing: ProcessingEngine, storage: Storage
+) -> processing_models.PushMessage:
+    push_message = processing_models.PushMessage(
+        timestamp=message_pb.timestamp.ToDatetime(),
+        who=message_pb.who,
+        to=list(message_pb.to),
+        ident=message_pb.ident,
+        content=processing_models.PushMessageContent(
+            text=message_pb.content.text,
+            format=_to_push_message_format(message_pb.content.format),
+            attachments=[],
+        ),
+    )
+    for cf in message_pb.content.attachments:
+        push_message.content.attachments.append(await processing.convert_internal_cf_to_str(cf, storage))
+    return push_message

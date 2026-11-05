@@ -1,0 +1,40 @@
+# image built in workflow and pushed to local registry
+image: localhost:32000/nucliadb
+imageVersion: test
+
+env:
+  DRIVER: pg
+  DRIVER_PG_URL: "{{ .Values.pg_url }}"
+
+  FILE_BACKEND: s3
+  S3_CLIENT_ID: "{{ .Values.minio_user }}"
+  S3_CLIENT_SECRET: "{{ .Values.minio_password }}"
+  S3_INDEXING_BUCKET: indexer
+  S3_BUCKET: "nucliadb-{kbid}"
+  S3_ENDPOINT: http://my-minio.default.svc.cluster.local:9000
+
+  NUCLIA_PUBLIC_URL: https://{zone}.stashify.cloud
+  NUCLIADB_DISABLE_ANALYTICS: "True"
+  ENVIRONMENT: "stage"
+  FLAG_SETTINGS_URL: https://cdn.rag.progress.cloud/features/features-v2.json
+  DEBUG: "true"
+
+replicas: 2
+
+nidx:
+  env:
+    METADATA__DATABASE_URL: "{{ .Values.pg_url }}"
+
+    INDEXER__OBJECT_STORE: s3
+    INDEXER__ENDPOINT: http://my-minio.default.svc.cluster.local:9000
+    INDEXER__BUCKET: indexer
+    INDEXER__CLIENT_ID: "{{ .Values.minio_user }}"
+    INDEXER__CLIENT_SECRET: "{{ .Values.minio_password }}"
+    INDEXER__REGION_NAME: local
+
+    STORAGE__OBJECT_STORE: s3
+    STORAGE__ENDPOINT: http://my-minio.default.svc.cluster.local:9000
+    STORAGE__BUCKET: nidx
+    STORAGE__CLIENT_ID: "{{ .Values.minio_user }}"
+    STORAGE__CLIENT_SECRET: "{{ .Values.minio_password }}"
+    STORAGE__REGION_NAME: local

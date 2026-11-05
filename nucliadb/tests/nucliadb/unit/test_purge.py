@@ -1,0 +1,127 @@
+# Copyright (C) 2021 Bosutech XXI S.L.
+#
+# nucliadb is offered under the AGPL v3.0 and as commercial software.
+# For commercial licensing, contact us at info@nuclia.com.
+#
+# AGPL:
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from nucliadb import purge
+from nucliadb.common.cluster.exceptions import NodeError, ShardNotFound
+
+
+class DataIterator:
+    def __init__(self, data):
+        self.data = data
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def __aiter__(self):
+        for item in self.data:
+            yield item
+
+
+@pytest.fixture
+def keys():
+    yield []
+
+
+@pytest.fixture
+def txn(keys):
+    mock = AsyncMock()
+    mock.keys = DataIterator(keys)
+    yield mock
+
+
+@pytest.fixture
+def driver(txn):
+    mock = AsyncMock()
+    cm = AsyncMock()
+    cm.__aenter__.return_value = txn
+    mock.ro_transaction = MagicMock(return_value=cm)
+    mock.rw_transaction = MagicMock(return_value=cm)
+    yield mock
+
+
+@pytest.fixture
+def storage():
+    mock = AsyncMock()
+    mock.delete_kb.return_value = True, False
+    yield mock
+
+
+@pytest.fixture(autouse=True)
+def kb():
+    mock = AsyncMock()
+    with patch("nucliadb.purge.KnowledgeBox", mock):
+        yield mock
+
+
+async def test_purge(kb, keys, driver):
+    keys.append("/pathto/kbid")
+
+    await purge.purge_kbs(driver)
+
+    kb.purge.assert_called_once_with(driver, "kbid")
+
+
+async def test_purge_handle_errors(kb, keys, driver):
+    keys.append("/failed")
+    keys.append("/pathto/failed")
+    keys.append("/pathto/failed")
+    keys.append("/pathto/failed")
+    keys.append("/pathto/failed")
+
+    kb.purge.side_effect = [ShardNotFound(), NodeError(), Exception(), None]
+    driver.begin.return_value.delete.side_effect = Exception()
+
+    await purge.purge_kbs(driver)
+
+
+async def test_purge_kb_storage(
+    keys,
+    driver,
+    storage,
+):
+    keys.append("/pathto/kbid")
+
+    await purge.purge_kbs_storage(driver, storage)
+
+
+async def test_purge_kb_storage_handle_errors(keys, driver, storage):
+    keys.append("/failed")
+    keys.append("/pathto/failed")
+
+    driver.begin.return_value.delete.side_effect = Exception()
+
+    await purge.purge_kbs_storage(driver, storage)
+
+
+async def test_main(driver, storage, dummy_nidx_utility):
+    with (
+        patch("nucliadb.purge.purge_kbs", AsyncMock()) as purge_kbs,
+        patch("nucliadb.purge.purge_kbs_storage", AsyncMock()) as purge_kbs_storage,
+        patch("nucliadb.purge.get_storage", return_value=storage),
+        patch("nucliadb.purge.setup_driver", return_value=driver),
+        patch("nucliadb.purge.setup_cluster", return_value=driver),
+    ):
+        await purge.main()
+
+        purge_kbs.assert_called_once_with(driver)
+        purge_kbs_storage.assert_called_once_with(driver, storage)
